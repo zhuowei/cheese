@@ -1,0 +1,1 @@
+exec ~/Library/Android/sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android34-clang -o cheese cheese.c
