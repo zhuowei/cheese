@@ -173,6 +173,8 @@ int main() {
     drawstate_cmds += cp_gpuaddr(drawstate_cmds, 0x1234567841414141);
     *drawstate_cmds++ = 0x42424242;
     *drawstate_cmds++ = 0x43434343;
+    drawstate_cmds += cp_wait_for_me(drawstate_cmds);
+    drawstate_cmds += cp_wait_for_idle(drawstate_cmds);
     *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
     drawstate_cmds += cp_gpuaddr(drawstate_cmds, output_gpuaddr + 4);
     *drawstate_cmds++ = 0x42424242;
