@@ -8,6 +8,14 @@ On unpatched Adreno A7xx devices, running this should print:
 0 0
 ```
 
+And if you run `adb bugreport`, in the kernel `dmesg`, you will see:
+
+```
+<2>[146532.566695][  T933] kgsl kgsl-3d0: GPU PAGE FAULT: addr = 4000031004 pid= 0 name=(null) drawctxt=1111638594 context pid = 0
+<2>[146532.566756][  T933] kgsl kgsl-3d0: context=gfx3d_user TTBR0=0x1234567841414141 (write unknown fault)
+<2>[146532.566783][  T933] kgsl kgsl-3d0: FAULTING BLOCK: CP
+```
+
 On Adreno A6xx devices, running this prints:
 
 ```
