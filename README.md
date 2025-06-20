@@ -67,7 +67,6 @@ and $02, $12, 0x3
 // if not 0 (kernel ring buffer), go to CP_NOP
 brne $02, 0x0, #l1873
 <actual SMMU modify code >
-(IB level = 4) & 0x3 == 0
 ```
 
 So with IB_LEVEL=4, masking 4 with 3 gives you 0, which passes the check for kernel ring buffer.
