@@ -210,7 +210,6 @@ struct cheese_gpu_rw {
     uint64_t output_gpuaddr;
 
     void* target_physical_page;
-    void* target_pbuf;
 
     uint64_t phyaddr;
 
@@ -405,11 +404,13 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
 
     // we don't need these anymore...
     for (int i = 0; i < NPBUFS; i++) {
-        if (i == target_pbuf) {
-            continue;
-        }
         void* pbuf = pbufs[i];
-        munmap(pbufs[i], pbuf_len);
+        if (i == target_pbuf) {
+            munmap(pbufs[i], target_physical_page - pbuf);
+            munmap(target_physical_page + 0x1000, (pbuf + pbuf_len) - (target_physical_page + 0x1000));
+        } else {
+            munmap(pbufs[i], pbuf_len);
+        }
         pbufs[i] = NULL;
     }
 
@@ -420,7 +421,6 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     cheese->output_buf = output_buf;
     cheese->output_gpuaddr = output_gpuaddr;
     cheese->target_physical_page = target_physical_page;
-    cheese->target_pbuf = pbufs[target_pbuf];
     cheese->phyaddr = phyaddr;
     cheese->garbage = garbage;
     return 0;
