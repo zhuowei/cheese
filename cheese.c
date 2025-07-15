@@ -577,6 +577,13 @@ static void stupid_memcpy(void* dst, const void* src, size_t count) {
     }
 }
 
+void stupid_setexeccon(const char* con) {
+    // don't want to build libselinux just for this...
+    int fd = open("/proc/thread-self/attr/exec", O_RDWR|O_CLOEXEC);
+    write(fd, con, strlen(con) + 1);
+    close(fd);
+}
+
 int main() {
     g_level1_dcache_size = tu_get_l1_dcache_size();
 #if 1
@@ -690,6 +697,7 @@ int main() {
         return 1;
     }
 
+    stupid_setexeccon("u:r:shell:s0"); // otherwise binder doesn't work
     execl("/system/bin/sh", "sh", NULL);
     fprintf(stderr, "can't exec?\n");
 
