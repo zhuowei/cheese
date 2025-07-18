@@ -185,6 +185,17 @@ uint64_t cheese_lookup_init_cred(
          (p - kallsyms_lookup->kernel_data);
 }
 
+uint64_t cheese_decode_adrp(uint32_t instr, uint64_t pc) {
+  uint32_t immhi = (instr >> 5) & ((1 << 19) - 1);  // 19 bits
+  uint32_t immlo = (instr >> 29) & 0b11;            // 2 bits
+  int64_t extended = ((int32_t)(immhi << 2 | immlo)) << 11 >> 11;
+  // fprintf(stderr, "%ld\n", extended);
+  int64_t off = extended << 12;
+  return
+      (pc & ~((1 << 12) - 1)) +
+      off;
+}
+
 uint64_t cheese_lookup_selinux_state(
     struct cheese_kallsyms_lookup* kallsyms_lookup) {
   /*
@@ -243,14 +254,7 @@ uint64_t cheese_lookup_selinux_state(
     if ((instr & BL_MASK) == BL_INST) {  // bl
       return found_addr;
     } else if ((instr & ADRP_X0_MASK) == ADRP_X0_INST) {
-      uint32_t immhi = (instr >> 5) & ((1 << 19) - 1);  // 19 bits
-      uint32_t immlo = (instr >> 29) & 0b11;            // 2 bits
-      int64_t extended = ((int32_t)(immhi << 2 | immlo)) << 11 >> 11;
-      // fprintf(stderr, "%ld\n", extended);
-      int64_t off = extended << 12;
-      found_addr =
-          ((sel_read_policy_addr + i * sizeof(uint32_t)) & ~((1 << 12) - 1)) +
-          off;
+      found_addr = cheese_decode_adrp(instr, sel_read_policy_addr + i * sizeof(uint32_t));
       // fprintf(stderr, "%lx\n", found_addr);
     } else if ((instr & ADD_X0_MASK) == ADD_X0_INST) {
       uint32_t imm = (instr >> 10) & ((1 << 12) - 1);

