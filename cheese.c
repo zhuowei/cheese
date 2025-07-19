@@ -350,7 +350,7 @@ const uint64_t kKernelPageTableEntry = 0x1e0;
 
 int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
 #ifdef DUMP_PAGEMAP
-    int pagemap_fd = getuid() == 0? open("/proc/self/pagemap", O_RDONLY): -1;
+    int pagemap_fd = getuid() == 0? open("/proc/self/pagemap", O_RDONLY|O_CLOEXEC): -1;
 #endif
 
     // strings - xbl_config.img |grep Kernel
@@ -439,7 +439,7 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     // end spray
     //fprintf(stderr, "end spray\n");
 
-    int fd = open("/dev/kgsl-3d0", O_RDWR);
+    int fd = open("/dev/kgsl-3d0", O_RDWR|O_CLOEXEC);
     if (fd == -1) {
         fprintf(stderr, "Can't open kgsl\n");
         return 1;
