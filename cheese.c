@@ -702,7 +702,7 @@ int main() {
 
     uint64_t init_cred_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "init_cred");
     if (force_manual_patchfinder || !init_cred_addr) {
-        uint64_t init_cred_addr = cheese_lookup_init_cred(&kallsyms_lookup);
+        init_cred_addr = cheese_lookup_init_cred(&kallsyms_lookup);
     }
     uint64_t commit_creds_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "commit_creds");
 

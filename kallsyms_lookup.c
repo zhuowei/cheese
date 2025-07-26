@@ -190,13 +190,12 @@ unsigned char init_cred_start_bytes_bin[] = {
 uint64_t cheese_lookup_init_cred(
     struct cheese_kallsyms_lookup* kallsyms_lookup) {
   void* p =
-      memmem(kallsyms_lookup->kernel_data, kallsyms_lookup->kernel_length,
-             init_cred_start_bytes_bin, sizeof(init_cred_start_bytes_bin));
+      memmem_last(kallsyms_lookup->kernel_data, kallsyms_lookup->kernel_length,
+                  init_cred_start_bytes_bin, sizeof(init_cred_start_bytes_bin));
   if (!p) {
     return 0;
   }
-  return kallsyms_lookup->kallsyms_relative_base +
-         (p - kallsyms_lookup->kernel_data);
+  return kallsyms_lookup->text_base + (p - kallsyms_lookup->kernel_data);
 }
 
 uint64_t cheese_decode_adrp(uint32_t instr, uint64_t pc) {
