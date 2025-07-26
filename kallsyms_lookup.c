@@ -14,7 +14,11 @@ struct cheese_kallsyms_lookup {
   const char* kallsyms_token_table;
   const uint16_t* kallsyms_token_index;
   char** decompressed_names;
+  uint64_t text_base;
 };
+
+uint64_t cheese_kallsyms_lookup(struct cheese_kallsyms_lookup* kallsyms_lookup,
+                                const char* name);
 
 static void* align_pointer_to_8(void* inptr) {
   return (void*)((((uintptr_t)inptr) + 7ull) & ~7ull);
@@ -149,6 +153,16 @@ int cheese_create_kallsyms_lookup(
       p += entry_token_count + 1;
     }
   }
+
+  uint64_t efi_header_end_addr =
+      cheese_kallsyms_lookup(kallsyms_lookup, "efi_header_end");
+  if (!efi_header_end_addr) {
+    fprintf(stderr, "can't find efi_header_end\n");
+    return 1;
+  }
+
+  uint64_t text_base = efi_header_end_addr - 0x10000;
+  kallsyms_lookup->text_base = text_base;
   return 0;
 }
 
@@ -233,12 +247,9 @@ uint64_t cheese_lookup_selinux_state(
   if (!sel_read_policy_addr) {
     return 0;
   }
-  uint64_t efi_header_end_addr =
-      cheese_kallsyms_lookup(kallsyms_lookup, "efi_header_end");
-  if (!efi_header_end_addr) {
-    return 0;
-  }
-  uint64_t text_base = efi_header_end_addr - 0x10000;
+
+  uint64_t text_base = kallsyms_lookup->text_base;
+
   uint64_t sel_read_policy_off = sel_read_policy_addr - text_base;
   const uint32_t* instrs = kallsyms_lookup->kernel_data + sel_read_policy_off;
   uint64_t found_addr = 0;

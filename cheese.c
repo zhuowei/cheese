@@ -689,7 +689,7 @@ int main() {
     const bool force_manual_patchfinder = false;
 
     // TODO(zhuowei): this is dumped from vmlinux-to-elf/kallsyms-finder on my computer and is specific to 51052260106700520 - need to auto detect this
-    uint64_t kernel_virtual_base = cheese_kallsyms_lookup(&kallsyms_lookup, "efi_header_end") - 0x10000;
+    uint64_t kernel_virtual_base = kallsyms_lookup.text_base;
     uint64_t kernel_selinux_state_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "selinux_state");
     if (force_manual_patchfinder || !kernel_selinux_state_addr) {
         kernel_selinux_state_addr = cheese_lookup_selinux_state(&kallsyms_lookup);
