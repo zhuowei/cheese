@@ -264,28 +264,30 @@ uint64_t cheese_lookup_selinux_state(
 
 // #ifndef KALLSYMS_LOOKUP_INCLUDE
 
-// #define PATH "/Volumes/orangehd/docs/oculus/q3/q3_51154110092200520/kernel"
-// // #define PATH "/Volumes/orangehd/docs/oculus/q3/q3_50473320162100510/kernel"
+ #define PATH "/Volumes/orangehd/docs/oculus/q3/q3_51154110092200520/kernel"
+ // #define PATH "/Volumes/orangehd/docs/oculus/q3/q3_50473320162100510/kernel"
 
-// __attribute__ ((weak)) int main() {
-//   FILE* f = fopen(PATH, "r");
-//   fseek(f, 0, SEEK_END);
-//   off_t file_length = ftell(f);
-//   fseek(f, 0, SEEK_SET);
-//   void* kernel_data = malloc(file_length);
-//   fread(kernel_data, 1, file_length, f);
-//   fclose(f);
-//   struct cheese_kallsyms_lookup kallsyms_lookup;
-//   if (cheese_create_kallsyms_lookup(&kallsyms_lookup, kernel_data,
-//                                     file_length)) {
-//     return 1;
-//   }
-//   uint64_t addr = cheese_kallsyms_lookup(&kallsyms_lookup, "selinux_state");
-//   printf("%llx\n", addr);
-//   uint64_t init_cred_addr = cheese_lookup_init_cred(&kallsyms_lookup);
-//   printf("%llx\n", init_cred_addr);
-//   uint64_t selinux_state = cheese_lookup_selinux_state(&kallsyms_lookup);
-//   printf("%llx\n", selinux_state);
-// }
+
+// __attribute__ ((weak)) allows for overwriting functions. in this case it allows to be overwritten with the cheese main
+__attribute__ ((weak)) int main() {
+  FILE* f = fopen(PATH, "r");
+  fseek(f, 0, SEEK_END);
+  off_t file_length = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  void* kernel_data = malloc(file_length);
+  fread(kernel_data, 1, file_length, f);
+  fclose(f);
+  struct cheese_kallsyms_lookup kallsyms_lookup;
+  if (cheese_create_kallsyms_lookup(&kallsyms_lookup, kernel_data,
+                                    file_length)) {
+    return 1;
+  }
+  uint64_t addr = cheese_kallsyms_lookup(&kallsyms_lookup, "selinux_state");
+  printf("%llx\n", addr);
+  uint64_t init_cred_addr = cheese_lookup_init_cred(&kallsyms_lookup);
+  printf("%llx\n", init_cred_addr);
+  uint64_t selinux_state = cheese_lookup_selinux_state(&kallsyms_lookup);
+  printf("%llx\n", selinux_state);
+}
 
 // #endif
