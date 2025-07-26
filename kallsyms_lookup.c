@@ -204,9 +204,7 @@ uint64_t cheese_decode_adrp(uint32_t instr, uint64_t pc) {
   int64_t extended = ((int32_t)(immhi << 2 | immlo)) << 11 >> 11;
   // fprintf(stderr, "%ld\n", extended);
   int64_t off = extended << 12;
-  return
-      (pc & ~((1 << 12) - 1)) +
-      off;
+  return (pc & ~((1 << 12) - 1)) + off;
 }
 
 uint64_t cheese_lookup_selinux_state(
@@ -264,7 +262,8 @@ uint64_t cheese_lookup_selinux_state(
     if ((instr & BL_MASK) == BL_INST) {  // bl
       return found_addr;
     } else if ((instr & ADRP_X0_MASK) == ADRP_X0_INST) {
-      found_addr = cheese_decode_adrp(instr, sel_read_policy_addr + i * sizeof(uint32_t));
+      found_addr = cheese_decode_adrp(
+          instr, sel_read_policy_addr + i * sizeof(uint32_t));
       // fprintf(stderr, "%lx\n", found_addr);
     } else if ((instr & ADD_X0_MASK) == ADD_X0_INST) {
       uint32_t imm = (instr >> 10) & ((1 << 12) - 1);
