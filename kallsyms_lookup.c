@@ -2,23 +2,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kallsyms_lookup.h"
 
-struct cheese_kallsyms_lookup {
-  const void* kernel_data;
-  size_t kernel_length;
-  // https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/kernel/kallsyms_internal.h;l=7;drc=64e166099b69bfc09f667253358a15160b86ea43
-  const int* kallsyms_offsets;
-  uint64_t kallsyms_relative_base;
-  unsigned int kallsyms_num_syms;
-  const uint8_t* kallsyms_names;
-  const char* kallsyms_token_table;
-  const uint16_t* kallsyms_token_index;
-  char** decompressed_names;
-  uint64_t text_base;
-};
+// dumped from 51154110092200520's kernel
+// dd if=kernel bs=1 skip=42016888 count=72 of=init_cred_start_bytes.bin
+unsigned char init_cred_start_bytes_bin[] = {
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0x01, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00};
 
-uint64_t cheese_kallsyms_lookup(struct cheese_kallsyms_lookup* kallsyms_lookup,
-                                const char* name);
 
 static void* align_pointer_to_8(void* inptr) {
   return (void*)((((uintptr_t)inptr) + 7ull) & ~7ull);
@@ -177,15 +172,7 @@ uint64_t cheese_kallsyms_lookup(struct cheese_kallsyms_lookup* kallsyms_lookup,
   return 0;
 }
 
-// dumped from 51154110092200520's kernel
-// dd if=kernel bs=1 skip=42016888 count=72 of=init_cred_start_bytes.bin
-unsigned char init_cred_start_bytes_bin[] = {
-    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0x01, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00};
+
 
 uint64_t cheese_lookup_init_cred(
     struct cheese_kallsyms_lookup* kallsyms_lookup) {
@@ -275,12 +262,14 @@ uint64_t cheese_lookup_selinux_state(
   return 0;
 }
 
-#ifndef KALLSYMS_LOOKUP_INCLUDE
+// #ifndef KALLSYMS_LOOKUP_INCLUDE
 
-#define PATH "/Volumes/orangehd/docs/oculus/q3/q3_51154110092200520/kernel"
-// #define PATH "/Volumes/orangehd/docs/oculus/q3/q3_50473320162100510/kernel"
+ #define PATH "/Volumes/orangehd/docs/oculus/q3/q3_51154110092200520/kernel"
+ // #define PATH "/Volumes/orangehd/docs/oculus/q3/q3_50473320162100510/kernel"
 
-int main() {
+
+// __attribute__ ((weak)) allows for overwriting functions. in this case it allows to be overwritten with the cheese main
+__attribute__ ((weak)) int main() {
   FILE* f = fopen(PATH, "r");
   fseek(f, 0, SEEK_END);
   off_t file_length = ftell(f);
@@ -301,4 +290,4 @@ int main() {
   printf("%llx\n", selinux_state);
 }
 
-#endif
+// #endif
