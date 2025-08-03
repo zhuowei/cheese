@@ -395,6 +395,9 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
      * checking commonly recurring entries in /proc/self/pagemap
      */
     uint64_t phyaddr = 0xfebeb000;
+    if (getenv("CHEESE_PHYADDR")) {
+        phyaddr = strtoull(getenv("CHEESE_PHYADDR"), NULL, 0);
+    }
 
     /* spray 16mb per mapping */
     uint64_t pbuf_len = PAGE_SIZE * 4096;
