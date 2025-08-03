@@ -651,7 +651,7 @@ void stupid_setexeccon(const char* con) {
     close(fd);
 }
 
-int main() {
+int main(int argc, char** argv) {
     g_level1_dcache_size = tu_get_l1_dcache_size();
 #if 1
     if (!getenv("CHEESE_SKIP_GPU")) {
@@ -765,7 +765,10 @@ int main() {
     }
 
     stupid_setexeccon("u:r:shell:s0"); // otherwise binder doesn't work
-    execl("/system/bin/sh", "sh", NULL);
+    char* const just_sh[] = {"sh", NULL};
+    char* const* new_argv = argc > 1? argv + 1: just_sh;
+
+    execvp(new_argv[0], new_argv);
     fprintf(stderr, "can't exec?\n");
 
     return 0;
