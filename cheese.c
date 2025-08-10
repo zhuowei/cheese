@@ -346,6 +346,8 @@ static int DoWrite(int fd, int ctx_id, uint32_t* payload_buf, uint64_t payload_g
     return 0;
 }
 
+const uint64_t gPhyAddrs[] = {0xfebeb000, 0xd0b3b000, 0xbe690000, 0xd5cf0000};
+
 const uint64_t kKernelPageTableEntry = 0x1e0;
 
 int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
@@ -397,6 +399,8 @@ int cheese_gpu_rw_setup(struct cheese_gpu_rw* cheese) {
     uint64_t phyaddr = 0xfebeb000;
     if (getenv("CHEESE_PHYADDR")) {
         phyaddr = strtoull(getenv("CHEESE_PHYADDR"), NULL, 0);
+    } else if (getenv("CHEESE_ATTEMPT")) {
+        phyaddr = gPhyAddrs[atoi(getenv("CHEESE_ATTEMPT"))];
     }
 
     /* spray 16mb per mapping */
@@ -654,6 +658,18 @@ void stupid_setexeccon(const char* con) {
     close(fd);
 }
 
+static void maybe_retry(char** argv) {
+    char* attempt = getenv("CHEESE_ATTEMPT");
+    int attempt_num = attempt? atoi(attempt): 0;
+    int new_attempt = attempt_num + 1;
+    if (new_attempt < sizeof(gPhyAddrs) / sizeof(*gPhyAddrs)) {
+        char new_attempt_str[10];
+        snprintf(new_attempt_str, sizeof(new_attempt_str), "%d", new_attempt);
+        setenv("CHEESE_ATTEMPT", new_attempt_str, true);
+        execv("/proc/self/exe", argv);
+    }
+}
+
 int main(int argc, char** argv) {
     g_level1_dcache_size = tu_get_l1_dcache_size();
 #if 1
@@ -661,6 +677,9 @@ int main(int argc, char** argv) {
         struct cheese_gpu_rw cheese = {};
         if (cheese_gpu_rw_setup(&cheese)) {
             fprintf(stderr, "can't get GPU r/w\n");
+            if (!getenv("CHEESE_NO_RETRY")) {
+                maybe_retry(argv);
+            }
             return 1;
         }
     }
