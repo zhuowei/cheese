@@ -1,3 +1,70 @@
+Root exploit for the Quest 3/3S for the August 7, 2025 update and earlier, based on [CVE-2025-21479](https://docs.qualcomm.com/product/publicresources/securitybulletin/june-2025-bulletin.html).
+
+![screenshot of Magisk, Cheese, and Termux with a root shell](https://github.com/user-attachments/assets/14e141c0-1430-4402-b5cb-4849bd0b2bfd)
+
+## Warning:
+
+- Rooting is dangerous. If you brick a Quest 3/3S, there is no way to repair it.
+
+- This disables all security when temp rooted.
+- Do NOT run apps or browse websites you don't trust.
+
+- Do NOT write to the boot or system partition. You will BRICK.
+- Do NOT use Magisk's "Install" feature.
+
+- You may want to back up your deviceKey, Meta Access Token and Oculus Access Token after root.
+
+## Download
+
+You can download an APK in the [Release](https://github.com/zhuowei/cheese/releases) section.
+
+## Guide to root
+
+See [FreeXR's guide to rooting the Quest 3/3S](https://github.com/FreeXR/eureka_panther-adreno-gpu-exploit-1).
+
+Join [FreeXR](https://discord.gg/ABCXxDyqrH)'s Discord for more information.
+
+## Supported versions
+
+- Quest 3: v79 5115411.12900.520 ([August 7, 2025](https://cocaine.trade/Quest_3_firmware)) and below, to about version v71.
+- Quest 3S: v79 117688.9900.610 ([August 6, 2025](https://cocaine.trade/Quest_3S_firmware)) and below, to about version v71.
+
+No newer versions are supported. (Older versions can be supported with more work.)
+
+## Unsupported versions
+
+Meta patched CVE-2025-21479 in these versions and any newer versions. They will NEVER be supported.
+
+- Quest 3: v79 5115411.13420.520 ([August 10, 2025](https://cocaine.trade/Quest_3_firmware))
+- Quest 3S: v79 117688.10380.610 ([August 10, 2025](https://cocaine.trade/Quest_3S_firmware))
+
+## Contains code from:
+
+ - adrenaline by Project Zero
+ - adreno_user from m-y-mo
+ - Freedreno from Mesa
+ - shellcode from Longterm Security
+ - Magisk from topjohnwu and the Magisk developers.
+
+## Source
+
+This repo contains the source for the command line `cheese` executable.
+
+The [cheese-app](https://github.com/zhuowei/cheese-app) repo contains the source for the app.
+
+## Thanks
+
+This is based on other researchers' Adreno GPU writeups: this uses code from:
+- [Project Zero/Ben Hawkes's Adrenaline](https://googleprojectzero.blogspot.com/2020/09/attacking-qualcomm-adreno-gpu.html)
+- [GitHub Security/Man Yue Mo's adreno_user](https://github.blog/security/vulnerability-research/the-code-that-wasnt-there-reading-memory-on-an-android-device-by-accident/)
+- [Freedreno/Rob Clark's kilroy](https://github.com/robclark/kilroy/blob/master/kilroy.c)
+
+Additional info on Adreno GPUs' firmware, including how to diff the firmware and how the firmware works, comes from from Freedreno's [afuc documentation](https://gitlab.freedesktop.org/mesa/mesa/-/blob/c0f56fc64cad946d5c4fda509ef3056994c183d9/src/freedreno/afuc/README.rst) by Rob Clark, Connor Abbott, and other Freedreno/Turnip contributors.
+
+Thanks to the developers at XRBreak and [FreeXR](https://discord.gg/ABCXxDyqrH) for all their help and contributions.
+
+====
+
 Proof-of-concept for [CVE-2025-21479](https://docs.qualcomm.com/product/publicresources/securitybulletin/june-2025-bulletin.html), demonstrating that it only affects Adreno A7xx (Snapdragon 8 Gen 1 / XR2 Gen 2 and newer) devices.
 
 This only tests whether the device is vulnerable - getting this to actually do anything interesting would require more effort.
@@ -35,16 +102,6 @@ adb push cheese /data/local/tmp
 adb shell /data/local/tmp/cheese
 ```
 
-# Thanks
-
-This is based on other researchers' Adreno GPU writeups: this uses code from:
-- [Project Zero/Ben Hawkes's Adrenaline](https://googleprojectzero.blogspot.com/2020/09/attacking-qualcomm-adreno-gpu.html)
-- [GitHub Security/Man Yue Mo's adreno_user](https://github.blog/security/vulnerability-research/the-code-that-wasnt-there-reading-memory-on-an-android-device-by-accident/)
-- [Freedreno/Rob Clark's kilroy](https://github.com/robclark/kilroy/blob/master/kilroy.c)
-
-Additional info on Adreno GPUs' firmware, including how to diff the firmware and how the firmware works, comes from from Freedreno's [afuc documentation](https://gitlab.freedesktop.org/mesa/mesa/-/blob/c0f56fc64cad946d5c4fda509ef3056994c183d9/src/freedreno/afuc/README.rst) by Rob Clark, Connor Abbott, and other Freedreno/Turnip contributors.
-
-Thanks to the [XRBreak community](https://estradiol.city/@ity/114482800282797778) for their support.
 
 # How it works
 
